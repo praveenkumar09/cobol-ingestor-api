@@ -1,0 +1,279 @@
+      *=================================================================
+      * PROGRAM-ID  : PLCYINQ
+      * DESCRIPTION : POLICY INQUIRY PROGRAM
+      *               RETRIEVES AND DISPLAYS POLICY DETAILS FOR A
+      *               GIVEN POLICY NUMBER. SUPPORTS BOTH ONLINE
+      *               AND BATCH INQUIRY MODES.
+      * AUTHOR      : INSURANCE SYSTEMS TEAM
+      * DATE-WRITTEN: 2024-01-15
+      * MODIFICATION HISTORY:
+      *   2024-03-10 - ADDED MULTI-POLICY SUPPORT (J.SMITH)
+      *   2024-05-20 - ENHANCED ERROR HANDLING (R.JONES)
+      *   2024-07-01 - ADDED BENEFICIARY COUNT DISPLAY (M.LEE)
+      *=================================================================
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. PLCYINQ.
+       AUTHOR. INSURANCE-SYSTEMS-TEAM.
+       DATE-WRITTEN. 2024-01-15.
+       DATE-COMPILED.
+
+       ENVIRONMENT DIVISION.
+       CONFIGURATION SECTION.
+       SOURCE-COMPUTER. IBM-ISERIES.
+       OBJECT-COMPUTER. IBM-ISERIES.
+       SPECIAL-NAMES.
+           DECIMAL-POINT IS COMMA.
+
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT POLICY-MASTER-FILE
+               ASSIGN TO DATABASE-PLCYMST
+               ORGANIZATION IS INDEXED
+               ACCESS MODE IS RANDOM
+               RECORD KEY IS PMR-POLICY-NUMBER
+               FILE STATUS IS WS-POLICY-FS.
+
+           SELECT CUSTOMER-MASTER-FILE
+               ASSIGN TO DATABASE-CUSTMST
+               ORGANIZATION IS INDEXED
+               ACCESS MODE IS RANDOM
+               RECORD KEY IS CST-CUSTOMER-NUMBER
+               FILE STATUS IS WS-CUSTOMER-FS.
+
+           SELECT POLICY-REPORT
+               ASSIGN TO PRINTER-QSYSPRT
+               ORGANIZATION IS SEQUENTIAL
+               FILE STATUS IS WS-REPORT-FS.
+
+       DATA DIVISION.
+       FILE SECTION.
+
+       FD POLICY-MASTER-FILE
+           LABEL RECORDS ARE STANDARD
+           RECORD CONTAINS 200 CHARACTERS.
+       COPY PLCYREC.
+
+       FD CUSTOMER-MASTER-FILE
+           LABEL RECORDS ARE STANDARD
+           RECORD CONTAINS 250 CHARACTERS.
+       COPY CUSTREC.
+
+       FD POLICY-REPORT
+           LABEL RECORDS ARE OMITTED
+           RECORD CONTAINS 132 CHARACTERS.
+       01 RPT-LINE                       PIC X(132).
+
+       WORKING-STORAGE SECTION.
+
+       01 WS-FILE-STATUS.
+          05 WS-POLICY-FS               PIC X(02) VALUE '00'.
+          05 WS-CUSTOMER-FS             PIC X(02) VALUE '00'.
+          05 WS-REPORT-FS               PIC X(02) VALUE '00'.
+
+       01 WS-PROGRAM-FLAGS.
+          05 WS-POLICY-NUMBER-IN        PIC X(10) VALUE SPACES.
+          05 WS-FOUND-FLAG              PIC X(01) VALUE 'N'.
+             88 WS-RECORD-FOUND             VALUE 'Y'.
+          05 WS-BATCH-MODE-FLAG         PIC X(01) VALUE 'N'.
+             88 WS-BATCH-MODE               VALUE 'Y'.
+
+       01 WS-DISPLAY-FIELDS.
+          05 WS-PREMIUM-DISPLAY         PIC $,$$$,$$9.99.
+          05 WS-COVERAGE-DISPLAY        PIC $$,$$$,$$$,$$9.99.
+          05 WS-DEDUCTIBLE-DISPLAY      PIC $,$$$,$$9.99.
+          05 WS-POLICY-TYPE-DESC        PIC X(22) VALUE SPACES.
+          05 WS-POLICY-STATUS-DESC      PIC X(15) VALUE SPACES.
+          05 WS-FREQ-DESC               PIC X(12) VALUE SPACES.
+
+       01 WS-REPORT-LINES.
+          05 WS-HEADING-LINE.
+             10 FILLER                  PIC X(15) VALUE '== POLICY INQ: '.
+             10 WS-HL-POLICY-NUM        PIC X(10).
+             10 FILLER                  PIC X(107) VALUE SPACES.
+          05 WS-DETAIL-LINE.
+             10 WS-DL-LABEL            PIC X(20).
+             10 WS-DL-VALUE            PIC X(50).
+             10 FILLER                 PIC X(62) VALUE SPACES.
+
+       COPY ERRMSGS.
+
+       PROCEDURE DIVISION.
+
+       0000-MAIN SECTION.
+       0000-MAIN-PARA.
+           PERFORM 1000-INIT-PARA
+           PERFORM 2000-GET-INPUT-PARA
+           PERFORM 3000-PROCESS-INQUIRY-PARA
+           PERFORM 9000-END-PARA
+           STOP RUN.
+
+       1000-INIT SECTION.
+       1000-INIT-PARA.
+           INITIALIZE WS-FILE-STATUS
+           INITIALIZE WS-PROGRAM-FLAGS
+           INITIALIZE WS-DISPLAY-FIELDS
+           MOVE 'PLCYINQ'              TO ERR-PROGRAM-NAME
+           MOVE FUNCTION CURRENT-DATE TO ERR-TIMESTAMP
+           OPEN INPUT  POLICY-MASTER-FILE
+           OPEN INPUT  CUSTOMER-MASTER-FILE
+           OPEN OUTPUT POLICY-REPORT
+           IF WS-POLICY-FS NOT = '00'
+               MOVE ERR-FILE-OPEN-FAILED TO ERR-RETURN-CODE
+               MOVE 'FAILED TO OPEN POLICY MASTER FILE'
+                                        TO ERR-MESSAGE-TEXT
+               PERFORM 8000-HANDLE-ERROR-PARA
+           END-IF
+           IF WS-CUSTOMER-FS NOT = '00'
+               MOVE ERR-FILE-OPEN-FAILED TO ERR-RETURN-CODE
+               MOVE 'FAILED TO OPEN CUSTOMER MASTER FILE'
+                                        TO ERR-MESSAGE-TEXT
+               PERFORM 8000-HANDLE-ERROR-PARA
+           END-IF
+           DISPLAY '** PLCYINQ - POLICY INQUIRY SYSTEM STARTED **'.
+
+       2000-GET-INPUT SECTION.
+       2000-GET-INPUT-PARA.
+           DISPLAY 'ENTER POLICY NUMBER (10 CHARACTERS): '
+           ACCEPT WS-POLICY-NUMBER-IN
+           MOVE FUNCTION UPPER-CASE(WS-POLICY-NUMBER-IN)
+               TO WS-POLICY-NUMBER-IN
+           IF WS-POLICY-NUMBER-IN = SPACES
+               MOVE ERR-INVALID-POLICY  TO ERR-RETURN-CODE
+               MOVE 'POLICY NUMBER CANNOT BE BLANK'
+                                        TO ERR-MESSAGE-TEXT
+               PERFORM 8000-HANDLE-ERROR-PARA
+           END-IF.
+
+       3000-PROCESS-INQUIRY SECTION.
+       3000-PROCESS-INQUIRY-PARA.
+           MOVE WS-POLICY-NUMBER-IN     TO PMR-POLICY-NUMBER
+           READ POLICY-MASTER-FILE
+               INVALID KEY
+                   MOVE ERR-RECORD-NOT-FOUND TO ERR-RETURN-CODE
+                   MOVE 'POLICY NOT FOUND IN MASTER FILE'
+                                        TO ERR-MESSAGE-TEXT
+                   PERFORM 8000-HANDLE-ERROR-PARA
+               NOT INVALID KEY
+                   MOVE 'Y'             TO WS-FOUND-FLAG
+                   PERFORM 3100-LOAD-CUSTOMER-PARA
+                   PERFORM 3200-BUILD-DESCRIPTIONS-PARA
+                   PERFORM 3300-WRITE-REPORT-PARA
+           END-READ.
+
+       3100-LOAD-CUSTOMER SECTION.
+       3100-LOAD-CUSTOMER-PARA.
+           MOVE PMR-CUSTOMER-NUMBER     TO CST-CUSTOMER-NUMBER
+           READ CUSTOMER-MASTER-FILE
+               INVALID KEY
+                   MOVE ERR-INVALID-CUSTOMER TO ERR-RETURN-CODE
+                   MOVE 'CUSTOMER RECORD NOT FOUND'
+                                        TO ERR-MESSAGE-TEXT
+                   PERFORM 8000-HANDLE-ERROR-PARA
+           END-READ.
+           IF PMR-LIFE-INSURANCE
+               CALL 'GETINTLFPOL' USING PMR-POLICY-NUMBER
+                                        ILP-POLICY-NUMBER
+               IF ILR-SUCCESS
+                   MOVE ILP-CASH-VALUE      TO WS-CASH-VALUE-OUT
+                   MOVE ILP-SURRENDER-VALUE TO WS-SURRENDER-VALUE-OUT
+               END-IF
+           END-IF.
+
+       3200-BUILD-DESCRIPTIONS SECTION.
+       3200-BUILD-DESCRIPTIONS-PARA.
+           EVALUATE TRUE
+               WHEN PMR-LIFE-INSURANCE
+                   MOVE 'LIFE INSURANCE'     TO WS-POLICY-TYPE-DESC
+               WHEN PMR-HEALTH-INSURANCE
+                   MOVE 'HEALTH INSURANCE'   TO WS-POLICY-TYPE-DESC
+               WHEN PMR-AUTO-INSURANCE
+                   MOVE 'AUTO INSURANCE'     TO WS-POLICY-TYPE-DESC
+               WHEN PMR-HOME-INSURANCE
+                   MOVE 'HOME INSURANCE'     TO WS-POLICY-TYPE-DESC
+               WHEN PMR-DISABILITY-INS
+                   MOVE 'DISABILITY INS'     TO WS-POLICY-TYPE-DESC
+               WHEN PMR-COMMERCIAL-INS
+                   MOVE 'COMMERCIAL INS'     TO WS-POLICY-TYPE-DESC
+               WHEN OTHER
+                   MOVE 'UNKNOWN TYPE'       TO WS-POLICY-TYPE-DESC
+           END-EVALUATE
+           EVALUATE TRUE
+               WHEN PMR-POLICY-ACTIVE
+                   MOVE 'ACTIVE'             TO WS-POLICY-STATUS-DESC
+               WHEN PMR-POLICY-LAPSED
+                   MOVE 'LAPSED'             TO WS-POLICY-STATUS-DESC
+               WHEN PMR-POLICY-CANCELLED
+                   MOVE 'CANCELLED'          TO WS-POLICY-STATUS-DESC
+               WHEN PMR-POLICY-PENDING
+                   MOVE 'PENDING APPROVAL'   TO WS-POLICY-STATUS-DESC
+               WHEN PMR-POLICY-SUSPENDED
+                   MOVE 'SUSPENDED'          TO WS-POLICY-STATUS-DESC
+               WHEN OTHER
+                   MOVE 'UNKNOWN STATUS'     TO WS-POLICY-STATUS-DESC
+           END-EVALUATE
+           EVALUATE TRUE
+               WHEN PMR-MONTHLY
+                   MOVE 'MONTHLY'            TO WS-FREQ-DESC
+               WHEN PMR-QUARTERLY
+                   MOVE 'QUARTERLY'          TO WS-FREQ-DESC
+               WHEN PMR-SEMI-ANNUAL
+                   MOVE 'SEMI-ANNUAL'        TO WS-FREQ-DESC
+               WHEN PMR-ANNUAL
+                   MOVE 'ANNUAL'             TO WS-FREQ-DESC
+               WHEN OTHER
+                   MOVE 'UNKNOWN'            TO WS-FREQ-DESC
+           END-EVALUATE
+           MOVE PMR-PREMIUM-AMOUNT      TO WS-PREMIUM-DISPLAY
+           MOVE PMR-COVERAGE-AMOUNT     TO WS-COVERAGE-DISPLAY
+           MOVE PMR-DEDUCTIBLE-AMOUNT   TO WS-DEDUCTIBLE-DISPLAY.
+
+       3300-WRITE-REPORT SECTION.
+       3300-WRITE-REPORT-PARA.
+           MOVE PMR-POLICY-NUMBER       TO WS-HL-POLICY-NUM
+           WRITE RPT-LINE FROM WS-HEADING-LINE
+           MOVE 'POLICY TYPE    : '     TO WS-DL-LABEL
+           MOVE WS-POLICY-TYPE-DESC     TO WS-DL-VALUE
+           WRITE RPT-LINE FROM WS-DETAIL-LINE
+           MOVE 'STATUS         : '     TO WS-DL-LABEL
+           MOVE WS-POLICY-STATUS-DESC   TO WS-DL-VALUE
+           WRITE RPT-LINE FROM WS-DETAIL-LINE
+           MOVE 'CUSTOMER NAME  : '     TO WS-DL-LABEL
+           STRING CST-FIRST-NAME ' ' CST-LAST-NAME
+               DELIMITED BY SIZE       INTO WS-DL-VALUE
+           WRITE RPT-LINE FROM WS-DETAIL-LINE
+           MOVE 'PREMIUM AMT    : '     TO WS-DL-LABEL
+           MOVE WS-PREMIUM-DISPLAY      TO WS-DL-VALUE
+           WRITE RPT-LINE FROM WS-DETAIL-LINE
+           MOVE 'COVERAGE AMT   : '     TO WS-DL-LABEL
+           MOVE WS-COVERAGE-DISPLAY     TO WS-DL-VALUE
+           WRITE RPT-LINE FROM WS-DETAIL-LINE
+           MOVE 'DEDUCTIBLE     : '     TO WS-DL-LABEL
+           MOVE WS-DEDUCTIBLE-DISPLAY   TO WS-DL-VALUE
+           WRITE RPT-LINE FROM WS-DETAIL-LINE
+           MOVE 'PAY FREQUENCY  : '     TO WS-DL-LABEL
+           MOVE WS-FREQ-DESC            TO WS-DL-VALUE
+           WRITE RPT-LINE FROM WS-DETAIL-LINE
+           MOVE 'OPEN CLAIMS    : '     TO WS-DL-LABEL
+           MOVE PMR-OPEN-CLAIMS-COUNT   TO WS-DL-VALUE
+           WRITE RPT-LINE FROM WS-DETAIL-LINE
+           MOVE 'BENEFICIARIES  : '     TO WS-DL-LABEL
+           MOVE PMR-BENEFICIARY-COUNT   TO WS-DL-VALUE
+           WRITE RPT-LINE FROM WS-DETAIL-LINE.
+
+       8000-HANDLE-ERROR SECTION.
+       8000-HANDLE-ERROR-PARA.
+           DISPLAY '** ERROR IN ' ERR-PROGRAM-NAME ' **'
+           DISPLAY '   CODE   : ' ERR-RETURN-CODE
+           DISPLAY '   MESSAGE: ' ERR-MESSAGE-TEXT
+           IF ERR-SYSTEM-ERROR OR ERR-FILE-OPEN-FAILED
+               PERFORM 9000-END-PARA
+               STOP RUN
+           END-IF.
+
+       9000-END SECTION.
+       9000-END-PARA.
+           CLOSE POLICY-MASTER-FILE
+           CLOSE CUSTOMER-MASTER-FILE
+           CLOSE POLICY-REPORT
+           DISPLAY '** PLCYINQ - PROCESSING COMPLETE. RC=' ERR-RETURN-CODE
+               ' **'.

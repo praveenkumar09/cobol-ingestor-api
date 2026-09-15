@@ -1,0 +1,287 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. CLMPRC.
+       AUTHOR. INSURANCE-SYSTEMS-TEAM.
+       DATE-WRITTEN. 2024-02-01.
+       DATE-COMPILED.
+
+       ENVIRONMENT DIVISION.
+       CONFIGURATION SECTION.
+       SOURCE-COMPUTER. IBM-ISERIES.
+       OBJECT-COMPUTER. IBM-ISERIES.
+
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT CLAIMS-INPUT-FILE
+               ASSIGN TO DATABASE-CLMINPT
+               ORGANIZATION IS SEQUENTIAL
+               ACCESS MODE IS SEQUENTIAL
+               FILE STATUS IS WS-CLAIM-INPUT-FS.
+
+           SELECT CLAIMS-MASTER-FILE
+               ASSIGN TO DATABASE-CLMMST
+               ORGANIZATION IS INDEXED
+               ACCESS MODE IS RANDOM
+               RECORD KEY IS CLM-CLAIM-NUMBER
+               FILE STATUS IS WS-CLAIM-MASTER-FS.
+
+           SELECT POLICY-MASTER-FILE
+               ASSIGN TO DATABASE-PLCYMST
+               ORGANIZATION IS INDEXED
+               ACCESS MODE IS RANDOM
+               RECORD KEY IS PMR-POLICY-NUMBER
+               FILE STATUS IS WS-POLICY-FS.
+
+           SELECT PAYMENT-QUEUE-FILE
+               ASSIGN TO DATABASE-PAYQUEUE
+               ORGANIZATION IS SEQUENTIAL
+               ACCESS MODE IS SEQUENTIAL
+               FILE STATUS IS WS-PAYMENT-FS.
+
+           SELECT CLAIMS-REPORT
+               ASSIGN TO PRINTER-QSYSPRT
+               FILE STATUS IS WS-REPORT-FS.
+
+       DATA DIVISION.
+       FILE SECTION.
+
+       FD CLAIMS-INPUT-FILE
+           LABEL RECORDS ARE STANDARD
+           RECORD CONTAINS 300 CHARACTERS.
+       01 CLAIMS-INPUT-RECORD            PIC X(300).
+
+       FD CLAIMS-MASTER-FILE
+           LABEL RECORDS ARE STANDARD
+           RECORD CONTAINS 280 CHARACTERS.
+       COPY CLMREC.
+
+       FD POLICY-MASTER-FILE
+           LABEL RECORDS ARE STANDARD
+           RECORD CONTAINS 200 CHARACTERS.
+       COPY PLCYREC.
+
+       FD PAYMENT-QUEUE-FILE
+           LABEL RECORDS ARE STANDARD
+           RECORD CONTAINS 100 CHARACTERS.
+       01 PAYMENT-QUEUE-RECORD.
+          05 PQR-CLAIM-NUMBER           PIC X(12).
+          05 PQR-POLICY-NUMBER          PIC X(10).
+          05 PQR-PAYMENT-AMOUNT         PIC 9(09)V99 COMP-3.
+          05 PQR-PAYMENT-TYPE           PIC X(02).
+          05 PQR-PRIORITY-CODE          PIC X(01).
+          05 PQR-QUEUE-DATE             PIC 9(08).
+          05 PQR-FILLER                 PIC X(57).
+
+       FD CLAIMS-REPORT
+           LABEL RECORDS ARE OMITTED
+           RECORD CONTAINS 132 CHARACTERS.
+       01 CLM-REPORT-LINE               PIC X(132).
+
+       WORKING-STORAGE SECTION.
+
+       01 WS-FILE-STATUS.
+          05 WS-CLAIM-INPUT-FS          PIC X(02) VALUE '00'.
+          05 WS-CLAIM-MASTER-FS         PIC X(02) VALUE '00'.
+          05 WS-POLICY-FS               PIC X(02) VALUE '00'.
+          05 WS-PAYMENT-FS              PIC X(02) VALUE '00'.
+          05 WS-REPORT-FS               PIC X(02) VALUE '00'.
+
+       01 WS-COUNTERS.
+          05 WS-TOTAL-CLAIMS            PIC 9(07) VALUE ZEROS.
+          05 WS-APPROVED-CLAIMS         PIC 9(07) VALUE ZEROS.
+          05 WS-REJECTED-CLAIMS         PIC 9(07) VALUE ZEROS.
+          05 WS-AUTO-APPROVED           PIC 9(07) VALUE ZEROS.
+          05 WS-PENDING-REVIEW          PIC 9(07) VALUE ZEROS.
+          05 WS-TOTAL-APPROVED-AMT      PIC 9(12)V99 COMP-3 VALUE ZEROS.
+
+       01 WS-CALC-FIELDS.
+          05 WS-APPROVED-AMT            PIC 9(09)V99 COMP-3 VALUE ZEROS.
+          05 WS-REMAINING-COVERAGE      PIC 9(09)V99 COMP-3 VALUE ZEROS.
+          05 WS-DEDUCTIBLE-BALANCE      PIC 9(07)V99 COMP-3 VALUE ZEROS.
+          05 WS-NET-CLAIM-AMT           PIC 9(09)V99 COMP-3 VALUE ZEROS.
+
+       01 WS-PROCESS-FLAGS.
+          05 WS-EOF-FLAG                PIC X(01) VALUE 'N'.
+             88 WS-END-OF-FILE              VALUE 'Y'.
+          05 WS-VALID-CLAIM-FLAG        PIC X(01) VALUE 'N'.
+             88 WS-CLAIM-IS-VALID           VALUE 'Y'.
+
+       COPY ERRMSGS.
+
+       PROCEDURE DIVISION.
+
+       0000-MAIN SECTION.
+       0000-MAIN-PARA.
+           PERFORM 1000-INIT-PARA
+           PERFORM 2000-READ-CLAIMS-LOOP-PARA
+               UNTIL WS-END-OF-FILE
+           PERFORM 9000-END-PARA
+           STOP RUN.
+
+       1000-INIT SECTION.
+       1000-INIT-PARA.
+           INITIALIZE WS-FILE-STATUS
+           INITIALIZE WS-COUNTERS
+           INITIALIZE WS-CALC-FIELDS
+           INITIALIZE WS-PROCESS-FLAGS
+           MOVE 'CLMPRC'               TO ERR-PROGRAM-NAME
+           MOVE FUNCTION CURRENT-DATE TO ERR-TIMESTAMP
+           OPEN INPUT  CLAIMS-INPUT-FILE
+           OPEN I-O    CLAIMS-MASTER-FILE
+           OPEN INPUT  POLICY-MASTER-FILE
+           OPEN EXTEND PAYMENT-QUEUE-FILE
+           OPEN OUTPUT CLAIMS-REPORT
+           IF WS-CLAIM-INPUT-FS NOT = '00'
+               MOVE ERR-FILE-OPEN-FAILED TO ERR-RETURN-CODE
+               MOVE 'FAILED TO OPEN CLAIMS INPUT FILE'
+                                        TO ERR-MESSAGE-TEXT
+               PERFORM 8000-HANDLE-ERROR-PARA
+           END-IF
+           DISPLAY '** CLMPRC - CLAIMS PROCESSING STARTED **'
+           PERFORM 2100-READ-NEXT-CLAIM-PARA.
+
+       2000-READ-CLAIMS-LOOP SECTION.
+       2000-READ-CLAIMS-LOOP-PARA.
+           ADD 1                        TO WS-TOTAL-CLAIMS
+           PERFORM 2200-VALIDATE-CLAIM-PARA
+           IF WS-CLAIM-IS-VALID
+               PERFORM 3000-CALC-APPROVED-AMOUNT-PARA
+               PERFORM 4000-UPDATE-CLAIM-STATUS-PARA
+               PERFORM 5000-QUEUE-PAYMENT-PARA
+           ELSE
+               PERFORM 4100-REJECT-CLAIM-PARA
+           END-IF
+           PERFORM 2100-READ-NEXT-CLAIM-PARA.
+
+       2100-READ-NEXT-CLAIM SECTION.
+       2100-READ-NEXT-CLAIM-PARA.
+           READ CLAIMS-INPUT-FILE
+               AT END MOVE 'Y'         TO WS-EOF-FLAG
+           END-READ.
+
+       2200-VALIDATE-CLAIM SECTION.
+       2200-VALIDATE-CLAIM-PARA.
+           MOVE 'N'                     TO WS-VALID-CLAIM-FLAG
+           MOVE CLM-POLICY-NUMBER       TO PMR-POLICY-NUMBER
+           READ POLICY-MASTER-FILE
+               INVALID KEY
+                   MOVE ERR-INVALID-POLICY TO ERR-RETURN-CODE
+                   MOVE 'POLICY NOT ON FILE'
+                                        TO ERR-MESSAGE-TEXT
+               NOT INVALID KEY
+                   EVALUATE TRUE
+                       WHEN PMR-POLICY-LAPSED
+                           MOVE ERR-POLICY-LAPSED TO ERR-RETURN-CODE
+                           MOVE 'POLICY IS LAPSED - CLAIM REJECTED'
+                                        TO ERR-MESSAGE-TEXT
+                       WHEN PMR-POLICY-CANCELLED
+                           MOVE ERR-POLICY-CANCELLED TO ERR-RETURN-CODE
+                           MOVE 'POLICY CANCELLED - CLAIM REJECTED'
+                                        TO ERR-MESSAGE-TEXT
+                       WHEN PMR-POLICY-ACTIVE
+                           IF CLM-CLAIM-AMOUNT > PMR-COVERAGE-AMOUNT
+                               MOVE ERR-AMOUNT-EXCEEDS-COVERAGE
+                                        TO ERR-RETURN-CODE
+                               MOVE 'CLAIM EXCEEDS POLICY COVERAGE'
+                                        TO ERR-MESSAGE-TEXT
+                           ELSE
+                               MOVE 'Y' TO WS-VALID-CLAIM-FLAG
+                               MOVE ERR-SUCCESS TO ERR-RETURN-CODE
+                           END-IF
+                       WHEN OTHER
+                           MOVE ERR-INVALID-POLICY TO ERR-RETURN-CODE
+                           MOVE 'POLICY STATUS INVALID FOR CLAIMS'
+                                        TO ERR-MESSAGE-TEXT
+                   END-EVALUATE
+           END-READ.
+
+       3000-CALC-APPROVED-AMOUNT SECTION.
+       3000-CALC-APPROVED-AMOUNT-PARA.
+           INITIALIZE WS-CALC-FIELDS
+           SUBTRACT PMR-DEDUCTIBLE-AMOUNT FROM CLM-CLAIM-AMOUNT
+               GIVING WS-NET-CLAIM-AMT
+           IF WS-NET-CLAIM-AMT <= ZEROS
+               MOVE ZEROS               TO WS-APPROVED-AMT
+           ELSE
+               MOVE WS-NET-CLAIM-AMT    TO WS-APPROVED-AMT
+           END-IF
+           SUBTRACT PMR-TOTAL-CLAIMS-PAID FROM PMR-COVERAGE-AMOUNT
+               GIVING WS-REMAINING-COVERAGE
+           IF WS-APPROVED-AMT > WS-REMAINING-COVERAGE
+               MOVE WS-REMAINING-COVERAGE TO WS-APPROVED-AMT
+           END-IF
+           MOVE WS-APPROVED-AMT         TO CLM-APPROVED-AMOUNT
+           MOVE PMR-DEDUCTIBLE-AMOUNT   TO CLM-DEDUCTIBLE-APPLIED.
+
+       4000-UPDATE-CLAIM-STATUS SECTION.
+       4000-UPDATE-CLAIM-STATUS-PARA.
+           IF CLM-APPROVED-AMOUNT <= PC-AUTO-APPROVE-LIMIT
+               MOVE 'A'                 TO CLM-CLAIM-STATUS
+               ADD 1                    TO WS-AUTO-APPROVED
+           ELSE
+               MOVE 'U'                 TO CLM-CLAIM-STATUS
+               ADD 1                    TO WS-PENDING-REVIEW
+           END-IF
+           MOVE FUNCTION CURRENT-DATE(1:8) TO CLM-PROCESS-DATE
+           WRITE CLAIMS-RECORD
+               INVALID KEY
+                   MOVE ERR-FILE-WRITE-FAILED TO ERR-RETURN-CODE
+                   MOVE 'FAILED TO WRITE CLAIMS MASTER'
+                                        TO ERR-MESSAGE-TEXT
+                   PERFORM 8000-HANDLE-ERROR-PARA
+           END-WRITE
+           ADD WS-APPROVED-AMT          TO WS-TOTAL-APPROVED-AMT
+           ADD 1                        TO WS-APPROVED-CLAIMS.
+
+       4100-REJECT-CLAIM SECTION.
+       4100-REJECT-CLAIM-PARA.
+           MOVE 'R'                     TO CLM-CLAIM-STATUS
+           MOVE ERR-RETURN-CODE         TO CLM-REJECTION-REASON-CODE
+           MOVE ERR-MESSAGE-TEXT        TO CLM-REJECTION-REASON-TEXT
+           MOVE FUNCTION CURRENT-DATE(1:8) TO CLM-PROCESS-DATE
+           WRITE CLAIMS-RECORD
+               INVALID KEY
+                   CONTINUE
+           END-WRITE
+           ADD 1                        TO WS-REJECTED-CLAIMS.
+
+       5000-QUEUE-PAYMENT SECTION.
+       5000-QUEUE-PAYMENT-PARA.
+           IF CLM-APPROVED AND CLM-APPROVED-AMOUNT > ZEROS
+               MOVE CLM-CLAIM-NUMBER    TO PQR-CLAIM-NUMBER
+               MOVE CLM-POLICY-NUMBER   TO PQR-POLICY-NUMBER
+               MOVE CLM-APPROVED-AMOUNT TO PQR-PAYMENT-AMOUNT
+               MOVE 'CH'               TO PQR-PAYMENT-TYPE
+               MOVE '3'                TO PQR-PRIORITY-CODE
+               MOVE FUNCTION CURRENT-DATE(1:8) TO PQR-QUEUE-DATE
+               WRITE PAYMENT-QUEUE-RECORD
+                   INVALID KEY
+                       MOVE ERR-FILE-WRITE-FAILED TO ERR-RETURN-CODE
+                       MOVE 'FAILED TO WRITE PAYMENT QUEUE'
+                                        TO ERR-MESSAGE-TEXT
+                       PERFORM 8000-HANDLE-ERROR-PARA
+               END-WRITE
+           END-IF.
+
+       8000-HANDLE-ERROR SECTION.
+       8000-HANDLE-ERROR-PARA.
+           DISPLAY '** ERROR IN ' ERR-PROGRAM-NAME ' **'
+           DISPLAY '   CODE   : ' ERR-RETURN-CODE
+           DISPLAY '   MESSAGE: ' ERR-MESSAGE-TEXT
+           IF ERR-SYSTEM-ERROR OR ERR-FILE-OPEN-FAILED
+               PERFORM 9000-END-PARA
+               STOP RUN
+           END-IF.
+
+       9000-END SECTION.
+       9000-END-PARA.
+           CLOSE CLAIMS-INPUT-FILE
+           CLOSE CLAIMS-MASTER-FILE
+           CLOSE POLICY-MASTER-FILE
+           CLOSE PAYMENT-QUEUE-FILE
+           CLOSE CLAIMS-REPORT
+           DISPLAY '** CLMPRC - PROCESSING COMPLETE **'
+           DISPLAY '   TOTAL CLAIMS   : ' WS-TOTAL-CLAIMS
+           DISPLAY '   APPROVED       : ' WS-APPROVED-CLAIMS
+           DISPLAY '   AUTO-APPROVED  : ' WS-AUTO-APPROVED
+           DISPLAY '   PENDING REVIEW : ' WS-PENDING-REVIEW
+           DISPLAY '   REJECTED       : ' WS-REJECTED-CLAIMS.

@@ -1,0 +1,13 @@
+{
+    "Servers": {
+        "1": {
+            "Name": "Cobol Ingestor API",
+            "Group": "Servers",
+            "Host": "postgres",
+            "Port": 5432,
+            "MaintenanceDB": "ingestor",
+            "Username": "admin",
+            "SSLMode": "prefer"
+        }
+    }
+}
