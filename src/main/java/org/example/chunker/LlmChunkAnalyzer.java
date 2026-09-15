@@ -76,10 +76,10 @@ public class LlmChunkAnalyzer {
             ? envModel
             : AppConfig.get("OPENAI_MODEL", "openai.chunk.model", chatDefault);
         String url = AppConfig.get("openai.chat.url", "https://api.openai.com/v1/chat/completions");
-        int maxTokens          = AppConfig.getInt("openai.chunk.max-tokens", 8000);
-        int windowLines        = AppConfig.getInt("openai.chunk.window-lines", 1200);
+        int maxTokens          = AppConfig.getInt("openai.chunk.max-tokens", 16000);
+        int windowLines        = AppConfig.getInt("openai.chunk.window-lines", 900);
         int windowMinLines     = AppConfig.getInt("openai.chunk.window-min-lines", 150);
-        int windowOverlapLines = AppConfig.getInt("openai.chunk.window-overlap-lines", 40);
+        int windowOverlapLines = AppConfig.getInt("openai.chunk.window-overlap-lines", 150);
         return new LlmChunkAnalyzer(key, model, url, maxTokens, windowLines, windowMinLines, windowOverlapLines);
     }
 
@@ -583,6 +583,16 @@ public class LlmChunkAnalyzer {
      * is the signature of the model hitting its own output-token ceiling mid
      * window — treated as "needs a smaller window", not "just retry the same
      * call again").
+     *
+     * <p>Before concluding a shortfall means truncation, checks for a simpler
+     * and surprisingly common failure: the model reporting line numbers below
+     * this window's own start — which is impossible for correctly-numbered
+     * absolute line numbers (a window can't cover lines before it begins) and
+     * is the signature of the model numbering its response some other way
+     * (e.g. relative to the excerpt) despite being shown absolute numbers. In
+     * that case the whole response is usually still complete and correct —
+     * just mislabeled — so it's shifted back into alignment and reused rather
+     * than discarded and retried/split for no real reason.
      */
     private ChunkAnalysis parseAndValidate(String json, int start, int end) {
         JsonNode root;
@@ -597,12 +607,41 @@ public class LlmChunkAnalyzer {
             throw new RetryUtil.NoRetryException("LLM returned no chunks for this window");
         }
 
-        int maxCoveredLine = analysis.chunks.stream().mapToInt(c -> c.lineEnd).max().orElse(0);
         int windowSize = end - start + 1;
-        int tolerance = Math.max(20, windowSize / 10);
-        if (maxCoveredLine < end - tolerance) {
-            throw new RetryUtil.NoRetryException("LLM output looks truncated — only covered up to line "
-                + maxCoveredLine + " of a window ending at line " + end);
+        // A shortfall within the configured overlap is not a real problem: the
+        // NEXT window starts inside that same overlap zone and will re-scan
+        // whatever this one left off (the model often reasonably declines to
+        // guess about a paragraph this window's own arbitrary line-count cutoff
+        // sliced in half). Only a shortfall bigger than the overlap can leave an
+        // actual gap, so that's the threshold that should trigger a retry/split.
+        int tolerance = Math.max(windowOverlapLines, windowSize / 10);
+
+        int minLine = analysis.chunks.stream().mapToInt(c -> c.lineStart).min().orElse(start);
+        int maxLine = analysis.chunks.stream().mapToInt(c -> c.lineEnd).max().orElse(0);
+
+        if (minLine < start) {
+            int reportedSpan = maxLine - minLine + 1;
+            // Only repair if the SHAPE of what was reported plausibly matches this
+            // window (not wildly larger/smaller) — otherwise this isn't a simple
+            // offset and forcing a shift would just paper over real garbage.
+            boolean spanPlausible = reportedSpan > 0 && reportedSpan <= windowSize * 2;
+            if (spanPlausible) {
+                int offset = start - minLine;
+                for (ChunkSpec c : analysis.chunks) {
+                    c.lineStart += offset;
+                    c.lineEnd += offset;
+                }
+                System.out.println("  [lines " + start + "-" + end + "] ... auto-corrected a "
+                    + offset + "-line numbering offset in the LLM's response ("
+                    + analysis.chunks.size() + " chunks kept)");
+                minLine += offset;
+                maxLine += offset;
+            }
+        }
+
+        if (maxLine < end - tolerance) {
+            throw new RetryUtil.NoRetryException("LLM output looks truncated — " + analysis.chunks.size()
+                + " chunks covering lines " + minLine + "-" + maxLine + " of a window " + start + "-" + end);
         }
         return analysis;
     }
