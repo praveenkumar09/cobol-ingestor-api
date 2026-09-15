@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.example.config.AppConfig;
 import org.example.model.FileChunk;
 import org.example.model.FileType;
+import org.example.util.RetryUtil;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -18,30 +19,46 @@ import java.util.Map;
 
 /**
  * Analyzes a whole source file (COBOL program, "Smart COBOL" variant, copybook,
- * COBOL-syntax batch job, or JCL job stream) with a single LLM call and lets the
- * model decide chunk boundaries and every semantic field for each chunk.
+ * COBOL-syntax batch job, or JCL job stream) with the LLM and lets the model
+ * decide chunk boundaries and every semantic field for each chunk.
  *
- * <p>No hardcoded division/section/step pattern matching — the model reads the
+ * <p>No hardcoded division/section/step pattern matching — the model reads
  * line-numbered source and returns structured JSON; this class only slices the
  * ORIGINAL source lines at the line ranges the model returns (so chunk content
  * is always byte-exact, never LLM-reproduced code).
+ *
+ * <p><b>Large files.</b> A file bigger than {@code openai.chunk.window-lines} is
+ * split up front into overlapping windows, each analyzed independently and then
+ * merged (overlap zones de-duplicated). A window that fails is retried, and if
+ * still failing is recursively split in half and retried — down to
+ * {@code openai.chunk.window-min-lines} — so a single dense/failing region
+ * shrinks itself rather than taking the whole file down. If a window at the
+ * floor size still can't be analyzed, its raw source is preserved as a single
+ * "unanalyzed" placeholder chunk rather than being dropped. A final coverage
+ * pass guarantees every line of the file ends up in some chunk — analyzed or
+ * placeholder — so no content is ever silently lost.
  */
 public class LlmChunkAnalyzer {
 
     private final String apiKey;
     private final String model;
     private final String url;
-    private final int maxContentChars;
     private final int maxTokens;
+    private final int windowLines;
+    private final int windowMinLines;
+    private final int windowOverlapLines;
     private final HttpClient http;
     private final ObjectMapper mapper;
 
-    private LlmChunkAnalyzer(String apiKey, String model, String url, int maxContentChars, int maxTokens) {
-        this.apiKey          = apiKey;
-        this.model            = model;
-        this.url              = url;
-        this.maxContentChars  = maxContentChars;
-        this.maxTokens        = maxTokens;
+    private LlmChunkAnalyzer(String apiKey, String model, String url, int maxTokens,
+                              int windowLines, int windowMinLines, int windowOverlapLines) {
+        this.apiKey             = apiKey;
+        this.model              = model;
+        this.url                = url;
+        this.maxTokens          = maxTokens;
+        this.windowLines        = windowLines;
+        this.windowMinLines     = windowMinLines;
+        this.windowOverlapLines = windowOverlapLines;
         this.http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(30))
             .build();
@@ -58,25 +75,216 @@ public class LlmChunkAnalyzer {
         String model = (envModel != null && !envModel.isBlank())
             ? envModel
             : AppConfig.get("OPENAI_MODEL", "openai.chunk.model", chatDefault);
-        String url        = AppConfig.get("openai.chat.url", "https://api.openai.com/v1/chat/completions");
-        int maxChars      = AppConfig.getInt("openai.chunk.max-content-chars", 100_000);
-        int maxTokens     = AppConfig.getInt("openai.chunk.max-tokens", 8000);
-        return new LlmChunkAnalyzer(key, model, url, maxChars, maxTokens);
+        String url = AppConfig.get("openai.chat.url", "https://api.openai.com/v1/chat/completions");
+        int maxTokens          = AppConfig.getInt("openai.chunk.max-tokens", 8000);
+        int windowLines        = AppConfig.getInt("openai.chunk.window-lines", 1200);
+        int windowMinLines     = AppConfig.getInt("openai.chunk.window-min-lines", 150);
+        int windowOverlapLines = AppConfig.getInt("openai.chunk.window-overlap-lines", 40);
+        return new LlmChunkAnalyzer(key, model, url, maxTokens, windowLines, windowMinLines, windowOverlapLines);
     }
 
     public String getModel() { return model; }
 
-    public ChunkAnalysis analyze(String fileName, FileType fileType, List<String> lines) throws Exception {
-        String numbered = numberLines(lines);
-        boolean truncated = false;
-        if (numbered.length() > maxContentChars) {
-            numbered = numbered.substring(0, maxContentChars) + "\n... [truncated]";
-            truncated = true;
+    // -------------------------------------------------------
+    // Entry point: proactively window large files, resiliently analyze
+    // each window, merge, then guarantee full line coverage.
+    // -------------------------------------------------------
+
+    public ChunkAnalysis analyze(String fileName, FileType fileType, List<String> lines) {
+        int totalLines = lines.size();
+        if (totalLines == 0) {
+            return new ChunkAnalysis();
         }
 
-        String prompt = buildPrompt(fileName, fileType, numbered, truncated);
-        String json = callOpenAi(prompt);
-        return parse(json);
+        List<int[]> windows = splitIntoWindows(totalLines);
+        List<ChunkAnalysis> results = new ArrayList<>(windows.size());
+        for (int[] w : windows) {
+            results.add(analyzeWindowResilient(fileName, fileType, lines, w[0], w[1]));
+        }
+
+        ChunkAnalysis merged = mergeWindowResults(results);
+        fillCoverageGaps(merged, totalLines);
+        return merged;
+    }
+
+    private List<int[]> splitIntoWindows(int totalLines) {
+        List<int[]> windows = new ArrayList<>();
+        if (totalLines <= windowLines) {
+            windows.add(new int[]{1, totalLines});
+            return windows;
+        }
+        int start = 1;
+        while (start <= totalLines) {
+            int end = Math.min(start + windowLines - 1, totalLines);
+            windows.add(new int[]{start, end});
+            if (end >= totalLines) break;
+            int next = end - windowOverlapLines + 1;
+            start = Math.max(next, start + 1);
+        }
+        return windows;
+    }
+
+    // -------------------------------------------------------
+    // Resilient per-window analysis: retry, then adaptively shrink on
+    // failure, down to a floor — below which raw content is preserved
+    // as a placeholder chunk rather than lost.
+    // -------------------------------------------------------
+
+    private ChunkAnalysis analyzeWindowResilient(String fileName, FileType fileType,
+                                                  List<String> lines, int start, int end) {
+        int size = end - start + 1;
+        String label = fileName + " [lines " + start + "-" + end + "]";
+        try {
+            return RetryUtil.withRetry(label, attempt -> {
+                String numbered = numberLinesRange(lines, start, end);
+                String prompt = buildPrompt(fileName, fileType, numbered);
+                String json = callOpenAiClassified(prompt);
+                return parseAndValidate(json, start, end);
+            });
+        } catch (Exception e) {
+            if (size <= windowMinLines) {
+                System.out.println("  " + label + " ... FAILED after retries — preserving raw content "
+                    + "without analysis: " + e.getMessage());
+                return placeholderAnalysis(start, end, e.getMessage());
+            }
+            System.out.println("  " + label + " ... failed (" + e.getMessage() + "), splitting and retrying");
+            int mid = start + size / 2;
+            ChunkAnalysis left  = analyzeWindowResilient(fileName, fileType, lines, start, mid - 1);
+            ChunkAnalysis right = analyzeWindowResilient(fileName, fileType, lines, mid, end);
+            return mergeTwo(left, right);
+        }
+    }
+
+    private ChunkAnalysis placeholderAnalysis(int start, int end, String reason) {
+        ChunkAnalysis analysis = new ChunkAnalysis();
+        analysis.chunks.add(placeholderSpec(start, end, reason));
+        return analysis;
+    }
+
+    private ChunkSpec placeholderSpec(int start, int end, String reason) {
+        ChunkSpec spec = new ChunkSpec();
+        spec.division = null;
+        spec.sectionName = "UNANALYZED_" + start + "_" + end;
+        spec.lineStart = start;
+        spec.lineEnd = end;
+        spec.sectionPurpose = "Automated analysis unavailable for lines " + start + "-" + end
+            + " after repeated failures (" + safeMessage(reason) + "). Raw source content is preserved below "
+            + "and remains searchable, but domain/purpose/relationship metadata could not be derived.";
+        spec.domain = "GENERAL";
+        spec.subDomain = "UNANALYZED";
+        spec.processingType = "UNANALYZED";
+        spec.filesRead = List.of();
+        spec.filesWritten = List.of();
+        spec.filesUpdated = List.of();
+        spec.filesDeleted = List.of();
+        spec.copybooksReferenced = List.of();
+        spec.entryPoints = List.of();
+        spec.externalProgramsCalled = List.of();
+        spec.paragraphsCalled = List.of();
+        spec.keyDataFields = List.of();
+        spec.businessConditions = List.of();
+        spec.hasFileIO = false;
+        spec.hasErrorHandling = false;
+        spec.tags = List.of("unanalyzed", "needs-review");
+        return spec;
+    }
+
+    private static String safeMessage(String s) {
+        return (s == null || s.isBlank()) ? "unknown error" : s;
+    }
+
+    // -------------------------------------------------------
+    // Merging window results
+    // -------------------------------------------------------
+
+    /** Merges two halves produced by recursively splitting one failing window. No overlap between these. */
+    private ChunkAnalysis mergeTwo(ChunkAnalysis a, ChunkAnalysis b) {
+        ChunkAnalysis merged = new ChunkAnalysis();
+        merged.programId           = firstNonBlank(a.programId, b.programId);
+        merged.author              = firstNonBlank(a.author, b.author);
+        merged.dateWritten         = firstNonBlank(a.dateWritten, b.dateWritten);
+        merged.programDescription  = firstNonBlank(a.programDescription, b.programDescription);
+        merged.copybooksUsed       = unionDistinct(a.copybooksUsed, b.copybooksUsed);
+        merged.entryPoints         = unionDistinct(a.entryPoints, b.entryPoints);
+        merged.chunks.addAll(a.chunks);
+        merged.chunks.addAll(b.chunks);
+        return merged;
+    }
+
+    /** Merges the top-level proactive windows, which DO overlap — de-duplicates the overlap zones. */
+    private ChunkAnalysis mergeWindowResults(List<ChunkAnalysis> results) {
+        ChunkAnalysis merged = new ChunkAnalysis();
+        for (ChunkAnalysis r : results) {
+            merged.programId          = firstNonBlank(merged.programId, r.programId);
+            merged.author             = firstNonBlank(merged.author, r.author);
+            merged.dateWritten        = firstNonBlank(merged.dateWritten, r.dateWritten);
+            merged.programDescription = firstNonBlank(merged.programDescription, r.programDescription);
+            merged.copybooksUsed      = unionDistinct(merged.copybooksUsed, r.copybooksUsed);
+            merged.entryPoints        = unionDistinct(merged.entryPoints, r.entryPoints);
+            merged.chunks.addAll(r.chunks);
+        }
+        merged.chunks.sort(Comparator.comparingInt(c -> c.lineStart));
+        merged.chunks = dedupOverlaps(merged.chunks);
+        return merged;
+    }
+
+    /** Keeps the first (earliest-starting) chunk when a later chunk's range is mostly already covered. */
+    private List<ChunkSpec> dedupOverlaps(List<ChunkSpec> sorted) {
+        List<ChunkSpec> kept = new ArrayList<>();
+        for (ChunkSpec c : sorted) {
+            int cLen = c.lineEnd - c.lineStart + 1;
+            boolean mostlyCovered = false;
+            for (ChunkSpec k : kept) {
+                int overlapStart = Math.max(c.lineStart, k.lineStart);
+                int overlapEnd   = Math.min(c.lineEnd, k.lineEnd);
+                int overlapLen   = overlapEnd - overlapStart + 1;
+                if (overlapLen > 0 && overlapLen >= cLen / 2) {
+                    mostlyCovered = true;
+                    break;
+                }
+            }
+            if (!mostlyCovered) kept.add(c);
+        }
+        return kept;
+    }
+
+    /**
+     * Final safety net: after merging, fill any remaining gap in 1..totalLines
+     * with a placeholder chunk. Guarantees every line belongs to some chunk
+     * even if a bug elsewhere in merge/dedup dropped a slice.
+     */
+    private void fillCoverageGaps(ChunkAnalysis merged, int totalLines) {
+        merged.chunks.sort(Comparator.comparingInt(c -> c.lineStart));
+        List<ChunkSpec> gaps = new ArrayList<>();
+        int cursor = 1;
+        for (ChunkSpec c : merged.chunks) {
+            if (c.lineStart > cursor) {
+                gaps.add(placeholderSpec(cursor, c.lineStart - 1, "merge produced a coverage gap"));
+            }
+            cursor = Math.max(cursor, c.lineEnd + 1);
+        }
+        if (cursor <= totalLines) {
+            gaps.add(placeholderSpec(cursor, totalLines, "merge produced a trailing coverage gap"));
+        }
+        if (!gaps.isEmpty()) {
+            merged.chunks.addAll(gaps);
+            merged.chunks.sort(Comparator.comparingInt(c -> c.lineStart));
+        }
+    }
+
+    private static String firstNonBlank(String a, String b) {
+        if (a != null && !a.isBlank()) return a;
+        return (b != null && !b.isBlank()) ? b : null;
+    }
+
+    private static List<String> unionDistinct(List<String> a, List<String> b) {
+        List<String> result = new ArrayList<>(a == null ? List.of() : a);
+        if (b != null) {
+            for (String s : b) {
+                if (!result.contains(s)) result.add(s);
+            }
+        }
+        return result;
     }
 
     // -------------------------------------------------------
@@ -158,15 +366,15 @@ public class LlmChunkAnalyzer {
     // Prompt construction
     // -------------------------------------------------------
 
-    private String numberLines(List<String> lines) {
+    private String numberLinesRange(List<String> lines, int start, int end) {
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < lines.size(); i++) {
-            sb.append(i + 1).append(": ").append(lines.get(i)).append("\n");
+        for (int i = start; i <= end; i++) {
+            sb.append(i).append(": ").append(lines.get(i - 1)).append("\n");
         }
         return sb.toString();
     }
 
-    private String buildPrompt(String fileName, FileType fileType, String numberedSource, boolean truncated) {
+    private String buildPrompt(String fileName, FileType fileType, String numberedSource) {
         String kindGuidance = switch (fileType) {
             case COPYBOOK -> """
                 This file is a COBOL COPYBOOK: a pure data-layout definition with no PROCEDURE DIVISION.
@@ -201,39 +409,40 @@ public class LlmChunkAnalyzer {
                 """;
         };
 
-        String truncNote = truncated
-            ? "\nNOTE: the source below was truncated to fit the model context window — only chunk the lines actually shown.\n"
-            : "";
-
         return """
             You are a COBOL/AS400 legacy-modernization expert building a RAG knowledge base and a
-            dependency graph directly from source code. You will be given the COMPLETE, line-numbered
-            source of one file. Decide, entirely from the code itself, how to split it into coherent
-            semantic chunks and what metadata each chunk carries. Do not rely on any fixed rule set —
-            read the actual code and use your own judgment.
+            dependency graph directly from source code. You will be given a line-numbered EXCERPT of one
+            file — it may be the whole file, or one window of a larger file, so it may start or end
+            mid-structure. Decide, entirely from the code shown, how to split it into coherent semantic
+            chunks and what metadata each chunk carries. Do not rely on any fixed rule set — read the
+            actual code and use your own judgment.
 
             FILE: %s
             DECLARED TYPE HINT: %s (a hint only — override it if the code itself indicates otherwise)
 
             %s
-            %s
-            SOURCE (line-numbered, 1-based; the lineStart/lineEnd you return must match these numbers exactly):
+
+            SOURCE (line-numbered; the lineStart/lineEnd you return must match these numbers exactly —
+            they are ABSOLUTE line numbers in the original file, not relative to this excerpt):
             ```
             %s
             ```
 
             TASK
-            1. Identify file-level metadata: the program/job id, author, date written, a short business
-               description, every COPY target referenced anywhere in the file, and every ENTRY point
-               declared anywhere in the file (empty arrays/null if not applicable).
-            2. Split the file into an ORDERED list of non-overlapping chunks that each represent one
+            1. Identify whatever file-level metadata is evident FROM THIS EXCERPT: the program/job id,
+               author, date written, a short business description, every COPY target referenced in this
+               excerpt, and every ENTRY point declared in this excerpt (empty arrays/null if not present
+               in what you were shown — do not guess at metadata that would only appear elsewhere in the
+               file).
+            2. Split the shown lines into an ORDERED list of non-overlapping chunks that each represent one
                coherent unit. Merge trivial fragments; split any unit larger than ~200 lines at a natural
-               sub-boundary. Every line of the file should belong to some chunk.
+               sub-boundary. Every line shown must belong to some chunk — including a partial unit at the
+               very start or end of this excerpt if the excerpt begins or ends mid-structure.
             3. For EACH chunk, decide every one of these values yourself, based only on that chunk's code
                and the file-level context above:
                - division: enclosing structural unit if applicable, else null.
                - sectionName: a short identifying name for the chunk, upper-cased, as it appears in the source.
-               - lineStart / lineEnd: 1-based inclusive line numbers matching the numbering shown above.
+               - lineStart / lineEnd: ABSOLUTE 1-based inclusive line numbers matching the numbering shown above.
                - sectionPurpose: 2-3 sentence BUSINESS-level description of what this chunk does — not
                  syntax narration.
                - domain: best-fit high-level business domain (e.g. INSURANCE, BANKING, GENERAL).
@@ -257,6 +466,9 @@ public class LlmChunkAnalyzer {
                - hasErrorHandling: true if this chunk contains error/exception handling.
                - tags: 4-10 lowercase-kebab search tags summarizing this chunk (domain, sub-domain,
                  capability words, "file-io"/"error-handling"/"batch"/"cics" as applicable).
+
+            IMPORTANT: cover every line shown, from the first line number to the last line number in the
+            source above, with chunks — do not stop early.
 
             OUTPUT — respond with ONLY a single JSON object, no markdown fences, no commentary, matching
             exactly this shape:
@@ -293,14 +505,19 @@ public class LlmChunkAnalyzer {
                 }
               ]
             }
-            """.formatted(fileName, fileType.label, kindGuidance, truncNote, numberedSource);
+            """.formatted(fileName, fileType.label, kindGuidance, numberedSource);
     }
 
     // -------------------------------------------------------
     // OpenAI call + JSON parsing
     // -------------------------------------------------------
 
-    private String callOpenAi(String prompt) throws Exception {
+    /**
+     * Calls OpenAI and classifies failures for the retry loop:
+     *   - network/5xx/429           -> RetryableApiException (retry same size, honoring Retry-After)
+     *   - other 4xx (e.g. context-length-exceeded), empty content -> NoRetryException (escalate: shrink window)
+     */
+    private String callOpenAiClassified(String prompt) throws Exception {
         Map<String, Object> body = Map.of(
             "model", model,
             "messages", List.of(Map.of("role", "user", "content", prompt)),
@@ -317,30 +534,80 @@ public class LlmChunkAnalyzer {
             .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
             .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
-        if (response.statusCode() != 200) {
-            throw new RuntimeException("OpenAI API HTTP " + response.statusCode() + ": " + response.body());
+        HttpResponse<String> response;
+        try {
+            response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        } catch (Exception e) {
+            throw new RetryUtil.RetryableApiException("HTTP call failed: " + e.getMessage(), null);
         }
 
-        JsonNode root = parseJson(response.body());
+        int status = response.statusCode();
+        if (status == 429 || status >= 500) {
+            throw new RetryUtil.RetryableApiException("OpenAI HTTP " + status, parseRetryAfterMs(response));
+        }
+        if (status != 200) {
+            throw new RetryUtil.NoRetryException(
+                "OpenAI HTTP " + status + ": " + truncate(response.body(), 300));
+        }
+
+        JsonNode root;
+        try {
+            root = mapper.readTree(response.body());
+        } catch (Exception e) {
+            throw new RetryUtil.RetryableApiException("Malformed HTTP envelope: " + e.getMessage(), null);
+        }
         String content = root.path("choices").get(0).path("message").path("content").asText();
         if (content == null || content.isBlank()) {
-            throw new RuntimeException("OpenAI returned an empty chunk analysis");
+            throw new RetryUtil.NoRetryException("OpenAI returned an empty response");
         }
         return content;
     }
 
-    private JsonNode parseJson(String text) {
-        try {
-            return mapper.readTree(text);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to parse JSON: " + e.getMessage(), e);
-        }
+    private static Long parseRetryAfterMs(HttpResponse<String> response) {
+        return response.headers().firstValue("Retry-After")
+            .map(v -> {
+                try { return Long.parseLong(v.trim()) * 1000; }
+                catch (NumberFormatException e) { return null; }
+            })
+            .orElse(null);
     }
 
-    private ChunkAnalysis parse(String json) {
-        JsonNode root = parseJson(json);
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max) + "...";
+    }
 
+    /**
+     * Parses the LLM's JSON and validates it's usable: non-empty, and its
+     * coverage roughly reaches the window's end (a large unexplained shortfall
+     * is the signature of the model hitting its own output-token ceiling mid
+     * window — treated as "needs a smaller window", not "just retry the same
+     * call again").
+     */
+    private ChunkAnalysis parseAndValidate(String json, int start, int end) {
+        JsonNode root;
+        try {
+            root = mapper.readTree(json);
+        } catch (Exception e) {
+            throw new RetryUtil.NoRetryException("Malformed JSON from LLM: " + e.getMessage(), e);
+        }
+
+        ChunkAnalysis analysis = toChunkAnalysis(root);
+        if (analysis.chunks.isEmpty()) {
+            throw new RetryUtil.NoRetryException("LLM returned no chunks for this window");
+        }
+
+        int maxCoveredLine = analysis.chunks.stream().mapToInt(c -> c.lineEnd).max().orElse(0);
+        int windowSize = end - start + 1;
+        int tolerance = Math.max(20, windowSize / 10);
+        if (maxCoveredLine < end - tolerance) {
+            throw new RetryUtil.NoRetryException("LLM output looks truncated — only covered up to line "
+                + maxCoveredLine + " of a window ending at line " + end);
+        }
+        return analysis;
+    }
+
+    private ChunkAnalysis toChunkAnalysis(JsonNode root) {
         ChunkAnalysis analysis = new ChunkAnalysis();
         analysis.programId = textOrNull(root, "programId");
         analysis.author = textOrNull(root, "author");
@@ -373,10 +640,6 @@ public class LlmChunkAnalyzer {
             spec.hasErrorHandling = c.path("hasErrorHandling").asBoolean(false);
             spec.tags = textArray(c.path("tags"));
             analysis.chunks.add(spec);
-        }
-
-        if (analysis.chunks.isEmpty()) {
-            throw new RuntimeException("LLM returned no chunks");
         }
         return analysis;
     }

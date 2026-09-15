@@ -3,6 +3,7 @@ package org.example.llm;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.example.model.FileChunk;
+import org.example.util.RetryUtil;
 
 import org.example.config.AppConfig;
 
@@ -13,10 +14,19 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Enriches chunk sectionPurpose using OpenAI chat completions.
  * Set OPENAI_API_KEY env var to enable; OPENAI_MODEL to override model (default: gpt-4o-mini).
+ *
+ * <p>One shared instance is used across the whole run (including all parallel
+ * file-processing workers — see Main), so failures are never silent and never
+ * lose a chunk's purpose: a failure always falls back to the chunk's existing
+ * (already-good, chunk-analysis-derived) purpose, transient failures are
+ * retried, and a sustained outage trips a circuit breaker so the rest of the
+ * run stops burning time retrying-and-failing chunk by chunk.
  */
 public class LlmEnricher {
 
@@ -27,11 +37,17 @@ public class LlmEnricher {
     private final HttpClient http;
     private final ObjectMapper mapper;
 
-    private LlmEnricher(String apiKey, String model, String openaiUrl, int maxContentChars) {
+    private final int circuitBreakerThreshold;
+    private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
+    private final AtomicBoolean circuitOpen = new AtomicBoolean(false);
+
+    private LlmEnricher(String apiKey, String model, String openaiUrl, int maxContentChars,
+                         int circuitBreakerThreshold) {
         this.apiKey          = apiKey;
         this.model           = model;
         this.openaiUrl       = openaiUrl;
         this.maxContentChars = maxContentChars;
+        this.circuitBreakerThreshold = circuitBreakerThreshold;
         this.http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(30))
             .build();
@@ -46,7 +62,8 @@ public class LlmEnricher {
         String defaultModel = AppConfig.get("openai.chat.model", "gpt-4o-mini");
         String url          = AppConfig.get("openai.chat.url", "https://api.openai.com/v1/chat/completions");
         int    maxChars     = AppConfig.getInt("openai.chat.max-content-chars", 2500);
-        return new LlmEnricher(key, (m != null && !m.isBlank()) ? m : defaultModel, url, maxChars);
+        int    breakerN     = AppConfig.getInt("openai.enrich.circuit-breaker-failures", 5);
+        return new LlmEnricher(key, (m != null && !m.isBlank()) ? m : defaultModel, url, maxChars, breakerN);
     }
 
     public String getModel() { return model; }
@@ -54,18 +71,34 @@ public class LlmEnricher {
     /**
      * Enriches the sectionPurpose of each chunk in-place.
      * Skips trivial chunks (preamble, identification blocks, near-empty sections)
-     * to avoid wasting API budget. On any error the rule-based purpose is preserved.
+     * to avoid wasting API budget. On any error the existing (chunk-analysis)
+     * purpose is preserved — enrichment is best-effort polish, never a
+     * requirement for a chunk to have a usable purpose.
      */
     public void enrichChunks(List<FileChunk> chunks) {
         for (FileChunk chunk : chunks) {
+            if (circuitOpen.get()) {
+                // Sustained outage already detected elsewhere in this run — stop
+                // spending time retrying every remaining chunk one by one; each
+                // chunk already has a decent purpose from chunk analysis.
+                return;
+            }
             if (isTrivial(chunk)) continue;
             try {
-                String enriched = callOpenAi(buildPrompt(chunk));
+                String enriched = RetryUtil.withRetry("enrich " + chunk.getChunkId(),
+                    attempt -> callOpenAiClassified(buildPrompt(chunk)));
                 if (enriched != null && !enriched.isBlank()) {
                     chunk.setSectionPurpose(enriched);
                 }
+                consecutiveFailures.set(0);
             } catch (Exception e) {
-                // Preserve existing rule-based purpose on failure
+                System.out.println("  WARNING: enrichment failed for " + chunk.getChunkId()
+                    + " — keeping existing purpose: " + e.getMessage());
+                int failures = consecutiveFailures.incrementAndGet();
+                if (failures >= circuitBreakerThreshold && circuitOpen.compareAndSet(false, true)) {
+                    System.out.println("  WARNING: " + failures + " consecutive enrichment failures — "
+                        + "disabling enrichment for the rest of this run (chunk-analysis purposes are kept)");
+                }
             }
         }
     }
@@ -123,7 +156,13 @@ public class LlmEnricher {
         );
     }
 
-    private String callOpenAi(String prompt) throws Exception {
+    /**
+     * Classifies failures the same way chunk analysis does: transient (network,
+     * 429/5xx) is worth retrying; other 4xx / empty content is not (retrying the
+     * exact same request won't change the outcome) — so RetryUtil escalates
+     * immediately in that case instead of wasting attempts.
+     */
+    private String callOpenAiClassified(String prompt) throws Exception {
         Map<String, Object> body = Map.of(
             "model", model,
             "messages", List.of(Map.of("role", "user", "content", prompt)),
@@ -139,14 +178,46 @@ public class LlmEnricher {
             .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
             .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() != 200) {
-            throw new RuntimeException("OpenAI API HTTP " + response.statusCode() + ": " + response.body());
+        HttpResponse<String> response;
+        try {
+            response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        } catch (Exception e) {
+            throw new RetryUtil.RetryableApiException("HTTP call failed: " + e.getMessage(), null);
         }
 
-        JsonNode root = mapper.readTree(response.body());
-        return root.path("choices").get(0).path("message").path("content").asText().trim();
+        int status = response.statusCode();
+        if (status == 429 || status >= 500) {
+            throw new RetryUtil.RetryableApiException("OpenAI HTTP " + status, parseRetryAfterMs(response));
+        }
+        if (status != 200) {
+            throw new RetryUtil.NoRetryException("OpenAI HTTP " + status + ": " + truncate(response.body(), 300));
+        }
+
+        JsonNode root;
+        try {
+            root = mapper.readTree(response.body());
+        } catch (Exception e) {
+            throw new RetryUtil.RetryableApiException("Malformed HTTP envelope: " + e.getMessage(), null);
+        }
+        String content = root.path("choices").get(0).path("message").path("content").asText();
+        if (content == null || content.isBlank()) {
+            throw new RetryUtil.NoRetryException("OpenAI returned an empty enrichment response");
+        }
+        return content.trim();
+    }
+
+    private static Long parseRetryAfterMs(HttpResponse<String> response) {
+        return response.headers().firstValue("Retry-After")
+            .map(v -> {
+                try { return Long.parseLong(v.trim()) * 1000; }
+                catch (NumberFormatException e) { return null; }
+            })
+            .orElse(null);
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max) + "...";
     }
 
     private static String nvl(String s, String fallback) {
