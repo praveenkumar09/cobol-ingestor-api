@@ -46,5 +46,12 @@ logs/
 ### Project: downloaded source & generated output ###
 # Remote source downloads (re-fetched on first run via SOURCE_URL)
 src/main/resources/input/github/
-# Generated chunks, knowledge graph, and visualization
-src/main/resources/output/
+# Keep input/output folders in git, but ignore their contents
+src/main/resources/input/cobol/*
+!src/main/resources/input/cobol/.gitkeep
+src/main/resources/input/copybooks/*
+!src/main/resources/input/copybooks/.gitkeep
+src/main/resources/input/jcl/*
+!src/main/resources/input/jcl/.gitkeep
+src/main/resources/output/*
+!src/main/resources/output/.gitkeep
