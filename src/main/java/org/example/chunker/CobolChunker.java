@@ -96,12 +96,10 @@ public class CobolChunker {
             if (c.getExternalProgramsCalled() != null) allCalls.addAll(c.getExternalProgramsCalled());
         }
 
-        String subDomain  = chunks.get(0).getSubDomain();
-        String procType   = chunks.get(0).getProcessingType();
-        String chunkDomain = chunks.get(0).getDomain();
+        LlmChunkAnalyzer.ProgramClassification classification = LlmChunkAnalyzer.majorityClassification(chunks);
 
         graphBuilder.registerCobolProgram(
-            programId, chunkDomain, subDomain, procType,
+            programId, classification.domain(), classification.subDomain(), classification.processingType(),
             analysis.author, analysis.dateWritten,
             new ArrayList<>(analysis.copybooksUsed),
             new ArrayList<>(analysis.entryPoints),

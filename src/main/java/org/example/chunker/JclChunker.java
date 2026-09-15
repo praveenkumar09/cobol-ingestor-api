@@ -79,10 +79,9 @@ public class JclChunker {
             if (c.getFilesWritten() != null) datasets.addAll(c.getFilesWritten());
         }
 
-        String domain    = chunks.get(0).getDomain();
-        String subDomain = chunks.get(0).getSubDomain();
+        LlmChunkAnalyzer.ProgramClassification classification = LlmChunkAnalyzer.majorityClassification(chunks);
 
-        graphBuilder.registerJclJob(jobName, domain, subDomain,
+        graphBuilder.registerJclJob(jobName, classification.domain(), classification.subDomain(),
             new ArrayList<>(programs), new ArrayList<>(datasets));
     }
 }

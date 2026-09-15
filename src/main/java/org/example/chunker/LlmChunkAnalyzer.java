@@ -14,6 +14,8 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -97,14 +99,87 @@ public class LlmChunkAnalyzer {
         }
 
         List<int[]> windows = splitIntoWindows(totalLines);
+        if (windows.size() > 1) {
+            System.out.println("  " + fileName + " ... " + totalLines + " lines, "
+                + windows.size() + " windows to analyze");
+        }
+
+        // Windows are analyzed strictly in file order (this loop, not
+        // parallel) — see CarriedContext for why that matters: it lets each
+        // window's prompt know what earlier windows of the SAME file already
+        // established, instead of judging domain/subDomain in total
+        // isolation from the rest of the file.
+        CarriedContext context = new CarriedContext();
         List<ChunkAnalysis> results = new ArrayList<>(windows.size());
-        for (int[] w : windows) {
-            results.add(analyzeWindowResilient(fileName, fileType, lines, w[0], w[1]));
+        for (int i = 0; i < windows.size(); i++) {
+            int[] w = windows.get(i);
+            ChunkAnalysis result = analyzeWindowResilient(
+                fileName, fileType, lines, w[0], w[1], context, i + 1, windows.size());
+            results.add(result);
+            context.absorb(result);
         }
 
         ChunkAnalysis merged = mergeWindowResults(results);
         fillCoverageGaps(merged, totalLines);
         return merged;
+    }
+
+    /**
+     * Minimal file-level context threaded sequentially from earlier windows
+     * into later windows' prompts. Without this, each window judges
+     * domain/subDomain in total isolation: a generic routing/dispatch
+     * paragraph analyzed on its own can reasonably look domain-agnostic even
+     * when it's part of the SAME insurance program as an earlier, obviously
+     * insurance-specific window — producing wildly inconsistent
+     * classifications for one file that then confuse an LLM asked to answer
+     * a question about "the program" using chunks from both.
+     *
+     * <p>Anchors to the first window that reports a non-GENERAL domain
+     * (rather than continuously re-voting as more windows complete) and
+     * never changes after that — simple and deterministic, and avoids
+     * locking in an early window's merely-uninformed "GENERAL" guess before
+     * a later window reveals the file's real domain.
+     */
+    private static final class CarriedContext {
+        String programId;
+        String author;
+        String dateWritten;
+        String programDescription;
+        String dominantDomain;
+        String dominantSubDomain;
+
+        void absorb(ChunkAnalysis a) {
+            programId = firstNonBlank(programId, a.programId);
+            author = firstNonBlank(author, a.author);
+            dateWritten = firstNonBlank(dateWritten, a.dateWritten);
+            programDescription = firstNonBlank(programDescription, a.programDescription);
+            if (dominantDomain == null) {
+                a.chunks.stream()
+                    .filter(c -> c.domain != null && !"GENERAL".equalsIgnoreCase(c.domain))
+                    .findFirst()
+                    .ifPresent(c -> {
+                        dominantDomain = c.domain;
+                        dominantSubDomain = c.subDomain;
+                    });
+            }
+        }
+
+        /** Null once nothing has been established yet (e.g. this is the file's first window). */
+        String describeForPrompt() {
+            if (programId == null && programDescription == null && dominantDomain == null) return null;
+            StringBuilder sb = new StringBuilder(
+                "CONTEXT ESTABLISHED FROM EARLIER WINDOWS OF THIS SAME FILE (for consistency — keep "
+                + "this chunk's domain/subDomain aligned with this UNLESS the code shown here clearly "
+                + "indicates a distinct, self-contained utility that genuinely doesn't fit):\n");
+            if (programId != null) sb.append("- Program/job id: ").append(programId).append("\n");
+            if (programDescription != null) sb.append("- Description: ").append(programDescription).append("\n");
+            if (dominantDomain != null) {
+                sb.append("- Established domain/subDomain: ").append(dominantDomain);
+                if (dominantSubDomain != null) sb.append(" / ").append(dominantSubDomain);
+                sb.append("\n");
+            }
+            return sb.toString();
+        }
     }
 
     private List<int[]> splitIntoWindows(int totalLines) {
@@ -130,17 +205,22 @@ public class LlmChunkAnalyzer {
     // as a placeholder chunk rather than lost.
     // -------------------------------------------------------
 
-    private ChunkAnalysis analyzeWindowResilient(String fileName, FileType fileType,
-                                                  List<String> lines, int start, int end) {
+    private ChunkAnalysis analyzeWindowResilient(String fileName, FileType fileType, List<String> lines,
+                                                  int start, int end, CarriedContext context,
+                                                  int windowNumber, int totalWindows) {
         int size = end - start + 1;
-        String label = fileName + " [lines " + start + "-" + end + "]";
+        String progress = totalWindows > 1 ? " [window " + windowNumber + "/" + totalWindows + "]" : "";
+        String label = fileName + progress + " [lines " + start + "-" + end + "]";
+        System.out.println("  " + label + " ... analyzing...");
         try {
-            return RetryUtil.withRetry(label, attempt -> {
+            ChunkAnalysis result = RetryUtil.withRetry(label, attempt -> {
                 String numbered = numberLinesRange(lines, start, end);
-                String prompt = buildPrompt(fileName, fileType, numbered);
+                String prompt = buildPrompt(fileName, fileType, numbered, context.describeForPrompt());
                 String json = callOpenAiClassified(prompt);
                 return parseAndValidate(json, start, end);
             });
+            System.out.println("  " + label + " ... " + result.chunks.size() + " chunks");
+            return result;
         } catch (Exception e) {
             if (size <= windowMinLines) {
                 System.out.println("  " + label + " ... FAILED after retries — preserving raw content "
@@ -149,8 +229,10 @@ public class LlmChunkAnalyzer {
             }
             System.out.println("  " + label + " ... failed (" + e.getMessage() + "), splitting and retrying");
             int mid = start + size / 2;
-            ChunkAnalysis left  = analyzeWindowResilient(fileName, fileType, lines, start, mid - 1);
-            ChunkAnalysis right = analyzeWindowResilient(fileName, fileType, lines, mid, end);
+            ChunkAnalysis left  = analyzeWindowResilient(
+                fileName, fileType, lines, start, mid - 1, context, windowNumber, totalWindows);
+            ChunkAnalysis right = analyzeWindowResilient(
+                fileName, fileType, lines, mid, end, context, windowNumber, totalWindows);
             return mergeTwo(left, right);
         }
     }
@@ -228,22 +310,49 @@ public class LlmChunkAnalyzer {
         return merged;
     }
 
-    /** Keeps the first (earliest-starting) chunk when a later chunk's range is mostly already covered. */
+    // Overlap beyond this many lines can no longer be explained by ordinary
+    // boundary fuzz (a chunk starting/ending a line or two differently than
+    // an adjacent one) — it means the same region of the file was genuinely
+    // analyzed twice, once per window.
+    private static final int OVERLAP_FUZZ_TOLERANCE_LINES = 10;
+
+    /**
+     * Drops a chunk whose line range substantially overlaps an already-kept
+     * one — the signature of the same region being analyzed independently by
+     * two different (adjacent, overlapping) windows. Real, distinct semantic
+     * units from a single coherent analysis don't overlap each other at all;
+     * any overlap beyond a small boundary-fuzz tolerance means duplication,
+     * not two legitimately different chunks that happen to share a few lines.
+     *
+     * <p>Compares against the SMALLER of the two chunks' own lengths (not just
+     * the candidate's) — using only the candidate's length here misses a real
+     * duplicate whenever the two overlapping chunks are very different sizes
+     * (e.g. a small single-paragraph chunk from one window entirely contained
+     * within a large multi-paragraph chunk from an adjacent window would be
+     * "small overlap" relative to the large chunk's length, but is 100% of
+     * the small chunk — a duplicate either way you look at it). This
+     * asymmetry is what let duplicate/overlapping chunks for the same file
+     * region survive into storage undetected.
+     */
     private List<ChunkSpec> dedupOverlaps(List<ChunkSpec> sorted) {
         List<ChunkSpec> kept = new ArrayList<>();
         for (ChunkSpec c : sorted) {
             int cLen = c.lineEnd - c.lineStart + 1;
-            boolean mostlyCovered = false;
+            boolean isDuplicate = false;
             for (ChunkSpec k : kept) {
                 int overlapStart = Math.max(c.lineStart, k.lineStart);
                 int overlapEnd   = Math.min(c.lineEnd, k.lineEnd);
                 int overlapLen   = overlapEnd - overlapStart + 1;
-                if (overlapLen > 0 && overlapLen >= cLen / 2) {
-                    mostlyCovered = true;
+                if (overlapLen <= OVERLAP_FUZZ_TOLERANCE_LINES) continue;
+
+                int kLen = k.lineEnd - k.lineStart + 1;
+                int smallerLen = Math.min(cLen, kLen);
+                if (overlapLen >= smallerLen * 0.5) {
+                    isDuplicate = true;
                     break;
                 }
             }
-            if (!mostlyCovered) kept.add(c);
+            if (!isDuplicate) kept.add(c);
         }
         return kept;
     }
@@ -374,7 +483,7 @@ public class LlmChunkAnalyzer {
         return sb.toString();
     }
 
-    private String buildPrompt(String fileName, FileType fileType, String numberedSource) {
+    private String buildPrompt(String fileName, FileType fileType, String numberedSource, String carriedContext) {
         String kindGuidance = switch (fileType) {
             case COPYBOOK -> """
                 This file is a COBOL COPYBOOK: a pure data-layout definition with no PROCEDURE DIVISION.
@@ -421,7 +530,7 @@ public class LlmChunkAnalyzer {
             DECLARED TYPE HINT: %s (a hint only — override it if the code itself indicates otherwise)
 
             %s
-
+            %s
             SOURCE (line-numbered; the lineStart/lineEnd you return must match these numbers exactly —
             they are ABSOLUTE line numbers in the original file, not relative to this excerpt):
             ```
@@ -505,7 +614,8 @@ public class LlmChunkAnalyzer {
                 }
               ]
             }
-            """.formatted(fileName, fileType.label, kindGuidance, numberedSource);
+            """.formatted(fileName, fileType.label, kindGuidance,
+                carriedContext != null ? carriedContext : "", numberedSource);
     }
 
     // -------------------------------------------------------
@@ -593,6 +703,18 @@ public class LlmChunkAnalyzer {
      * that case the whole response is usually still complete and correct —
      * just mislabeled — so it's shifted back into alignment and reused rather
      * than discarded and retried/split for no real reason.
+     *
+     * <p>That repair is only trusted when a MAJORITY of the window's chunks
+     * show the same below-start pattern — i.e. the whole response is
+     * uniformly mis-numbered. If only one or two outlier chunks report a low
+     * lineStart while the rest are already correctly positioned within this
+     * window, the outliers are the problem, not the window's numbering as a
+     * whole: shifting every chunk by an offset computed from an outlier would
+     * drag the ALREADY-CORRECT majority away from their true position and
+     * into overlap with whatever an adjacent window legitimately covers
+     * there — turning one bad chunk into a duplicated/misplaced region. In
+     * that case the repair is skipped and this falls through to the normal
+     * truncation check on the unmodified analysis.
      */
     private ChunkAnalysis parseAndValidate(String json, int start, int end) {
         JsonNode root;
@@ -625,7 +747,9 @@ public class LlmChunkAnalyzer {
             // window (not wildly larger/smaller) — otherwise this isn't a simple
             // offset and forcing a shift would just paper over real garbage.
             boolean spanPlausible = reportedSpan > 0 && reportedSpan <= windowSize * 2;
-            if (spanPlausible) {
+            long belowStartCount = analysis.chunks.stream().filter(c -> c.lineStart < start).count();
+            boolean systematic = belowStartCount * 2 >= analysis.chunks.size();
+            if (spanPlausible && systematic) {
                 int offset = start - minLine;
                 for (ChunkSpec c : analysis.chunks) {
                     c.lineStart += offset;
@@ -636,6 +760,10 @@ public class LlmChunkAnalyzer {
                     + analysis.chunks.size() + " chunks kept)");
                 minLine += offset;
                 maxLine += offset;
+            } else if (spanPlausible) {
+                System.out.println("  [lines " + start + "-" + end + "] ... " + belowStartCount + "/"
+                    + analysis.chunks.size() + " chunks reported lines before this window's start — "
+                    + "not a majority, skipping auto-repair to avoid displacing the correctly-numbered chunks");
             }
         }
 
@@ -700,6 +828,47 @@ public class LlmChunkAnalyzer {
         }
         return result;
     }
+
+    // -------------------------------------------------------
+    // Program/job-level classification rollup
+    // -------------------------------------------------------
+
+    /**
+     * Majority-vote domain/subDomain/processingType across a file's chunks,
+     * used as the single program- or job-level classification for the
+     * knowledge graph. Each window is analyzed independently with no
+     * visibility into how OTHER windows of the same file were classified, so
+     * different sections of one large file can end up with different
+     * domain/subDomain/processingType labels — legitimately (a shared
+     * utility paragraph really can look domain-agnostic in isolation) or not
+     * (see the dedup/repair fixes above). Either way, the file as a whole
+     * needs ONE consistent classification for the graph, so this picks
+     * whichever combination the chunks agree on most, weighted by how many
+     * lines each chunk covers — a single large, clearly-classified section
+     * should outweigh a couple of short, ambiguous ones — rather than
+     * arbitrarily trusting whichever chunk happened to be first.
+     */
+    public static ProgramClassification majorityClassification(List<FileChunk> chunks) {
+        Map<String, Integer> weightByKey = new LinkedHashMap<>();
+        Map<String, ProgramClassification> valueByKey = new HashMap<>();
+        for (FileChunk c : chunks) {
+            if (c.getDomain() == null) continue;
+            String key = c.getDomain() + "|" + c.getSubDomain() + "|" + c.getProcessingType();
+            int lines = Math.max(1, c.getLineEnd() - c.getLineStart() + 1);
+            weightByKey.merge(key, lines, Integer::sum);
+            valueByKey.putIfAbsent(key,
+                new ProgramClassification(c.getDomain(), c.getSubDomain(), c.getProcessingType()));
+        }
+        return weightByKey.entrySet().stream()
+            .max(Map.Entry.comparingByValue())
+            .map(e -> valueByKey.get(e.getKey()))
+            .orElseGet(() -> chunks.isEmpty()
+                ? new ProgramClassification("GENERAL", null, null)
+                : new ProgramClassification(chunks.get(0).getDomain(), chunks.get(0).getSubDomain(),
+                    chunks.get(0).getProcessingType()));
+    }
+
+    public record ProgramClassification(String domain, String subDomain, String processingType) {}
 
     // -------------------------------------------------------
     // Result model

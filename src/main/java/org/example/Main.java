@@ -36,6 +36,12 @@ public class Main {
     private static final int PARALLELISM =
         AppConfig.getInt("INGEST_PARALLELISM", "ingest.parallelism", 10);
 
+    // A file over this many lines needs multiple LLM chunking windows — see
+    // processFilesTiered below for why these are pulled out of the fast
+    // parallel batch entirely instead of being mixed in with small files.
+    private static final int LARGE_FILE_THRESHOLD_LINES =
+        AppConfig.getInt("INGEST_LARGE_FILE_THRESHOLD_LINES", "ingest.large-file-threshold-lines", 900);
+
     /** Thread-safe totalFiles/totalChunks counters shared across parallel workers. */
     private static final class Counters {
         final AtomicInteger files  = new AtomicInteger();
@@ -164,7 +170,7 @@ public class Main {
                 }
                 System.out.println("  Found " + cardFiles.size() + " source files");
 
-                runInBatches(cardFiles, PARALLELISM, file -> processOneFile(
+                processFilesTiered(cardFiles, file -> processOneFile(
                     file, cardDemoRoot.relativize(file).toString(), FileType.COPYBOOK,
                     cobolChunker, jclChunker, graphBuilder, writer, outputDir,
                     counters, enricher, allChunks));
@@ -309,7 +315,7 @@ public class Main {
             return;
         }
 
-        runInBatches(files, PARALLELISM, file -> processOneFile(
+        processFilesTiered(files, file -> processOneFile(
             file, file.getFileName().toString(), cobolType,
             cobolChunker, jclChunker, graphBuilder, writer, outputDir,
             counters, enricher, allChunks));
@@ -367,10 +373,51 @@ public class Main {
         System.out.println("  " + displayName + " ... " + chunks.size() + " chunks");
     }
 
-    // ─── Batched parallel execution: PARALLELISM files at a time ───────────────
+    // ─── Tiered scheduling: small files fast/parallel, large files careful/solo ─
+    // A large file can take many sequential LLM chunking-window calls — one
+    // per ~900 lines (see LlmChunkAnalyzer). Mixing it into a fixed-size
+    // parallel batch means every OTHER file in that batch finishes and its
+    // worker thread sits idle for however long the large file takes, since
+    // the whole batch is awaited together before the next one starts (see
+    // runInBatches). Splitting large files into their own one-at-a-time
+    // phase means small files' throughput is never held hostage by a large
+    // one, and each large file gets the run's full, undivided attention —
+    // no competing with PARALLELISM other concurrent calls for OpenAI rate-
+    // limit headroom while it works through its many windows.
+
+    private static void processFilesTiered(List<Path> files, Consumer<Path> task) {
+        if (files.isEmpty()) return;
+
+        List<Path> small = new ArrayList<>();
+        List<Path> large = new ArrayList<>();
+        for (Path file : files) {
+            if (countLines(file) > LARGE_FILE_THRESHOLD_LINES) large.add(file);
+            else small.add(file);
+        }
+
+        if (!large.isEmpty()) {
+            System.out.println("  " + large.size() + " file(s) over " + LARGE_FILE_THRESHOLD_LINES
+                + " lines set aside for careful, one-at-a-time processing after the fast batch below");
+        }
+
+        runInBatches(small, PARALLELISM, task);
+        runInBatches(large, 1, task);
+    }
+
+    private static long countLines(Path file) {
+        try (Stream<String> lines = Files.lines(file)) {
+            return lines.count();
+        } catch (IOException e) {
+            return 0; // Unreadable — treat as small; the real processing step reports the actual error.
+        }
+    }
+
+    // ─── Batched parallel execution: N files at a time ─────────────────────────
     // Runs each batch fully in parallel on a fixed-size pool, then blocks
     // (invokeAll) until the whole batch finishes before starting the next
-    // batch — matching "ten in parallel, then the next ten" exactly.
+    // batch — matching "N in parallel, then the next N" exactly. Called with
+    // batchSize=1 for the large-file tier above, which naturally processes
+    // that list strictly one at a time.
 
     private static void runInBatches(List<Path> files, int batchSize, Consumer<Path> task) {
         if (files.isEmpty()) return;
