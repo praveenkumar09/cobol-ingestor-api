@@ -1,3 +1,7 @@
+# The single owner of Postgres + Neo4j for local dev. cobalt-rag-api attaches
+# to the `cobalt-shared` network defined below as a client (see its own
+# docker-compose.yml) rather than running its own copies — bring this stack
+# up FIRST, then cobalt-rag-api's.
 services:
 
   postgres:
@@ -55,6 +59,10 @@ services:
       timeout: 10s
       retries: 20
       start_period: 30s
+
+networks:
+  default:
+    name: cobalt-shared
 
 volumes:
   postgres_data:

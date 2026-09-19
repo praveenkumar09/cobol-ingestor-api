@@ -217,6 +217,8 @@ public class Main {
             System.out.println("  Commit SHA        : " + currentSha);
         }
         System.out.println("============================================");
+        System.out.println(LlmChunkAnalyzer.failureSummary());
+        System.out.println("============================================");
     }
 
     // ─── Embed all embeddable chunks in BATCH_SIZE batches ─────────────────────

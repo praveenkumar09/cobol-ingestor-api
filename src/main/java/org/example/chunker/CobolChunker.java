@@ -79,6 +79,12 @@ public class CobolChunker {
                 .filter(Objects::nonNull)
                 .collect(Collectors.toList());
             graphBuilder.registerCopybook(programId, fileName, records);
+
+            Set<String> allFieldsDefined = new LinkedHashSet<>();
+            for (FileChunk c : chunks) {
+                if (c.getFieldsDefined() != null) allFieldsDefined.addAll(c.getFieldsDefined());
+            }
+            graphBuilder.registerCopybookFields(programId, new ArrayList<>(allFieldsDefined));
             return;
         }
 
@@ -87,6 +93,8 @@ public class CobolChunker {
         Set<String> allUpdated = new LinkedHashSet<>();
         Set<String> allDeleted = new LinkedHashSet<>();
         Set<String> allCalls   = new LinkedHashSet<>();
+        Set<String> allFieldsDefined    = new LinkedHashSet<>();
+        Set<String> allFieldsReferenced = new LinkedHashSet<>();
 
         for (FileChunk c : chunks) {
             if (c.getFilesRead()             != null) allRead.addAll(c.getFilesRead());
@@ -94,6 +102,8 @@ public class CobolChunker {
             if (c.getFilesUpdated()          != null) allUpdated.addAll(c.getFilesUpdated());
             if (c.getFilesDeleted()          != null) allDeleted.addAll(c.getFilesDeleted());
             if (c.getExternalProgramsCalled() != null) allCalls.addAll(c.getExternalProgramsCalled());
+            if (c.getFieldsDefined()          != null) allFieldsDefined.addAll(c.getFieldsDefined());
+            if (c.getFieldsReferenced()       != null) allFieldsReferenced.addAll(c.getFieldsReferenced());
         }
 
         LlmChunkAnalyzer.ProgramClassification classification = LlmChunkAnalyzer.majorityClassification(chunks);
@@ -108,5 +118,6 @@ public class CobolChunker {
             new ArrayList<>(allUpdated),
             new ArrayList<>(allDeleted),
             new ArrayList<>(allCalls));
+        graphBuilder.registerProgramFields(programId, new ArrayList<>(allFieldsDefined), new ArrayList<>(allFieldsReferenced));
     }
 }

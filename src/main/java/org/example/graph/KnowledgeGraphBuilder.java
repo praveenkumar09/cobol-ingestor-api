@@ -65,6 +65,47 @@ public class KnowledgeGraphBuilder {
         if (!recordLayouts.isEmpty()) node.getProperties().put("recordLayouts", recordLayouts);
     }
 
+    /** Fields a copybook's record layout defines — used to build the FIELD-level
+     * dependency graph so impact analysis can tell exactly which programs/copybooks
+     * touch a specific field, not just which ones share the enclosing copybook. */
+    public synchronized void registerCopybookFields(String copybookId, List<String> fieldsDefined) {
+        for (String field : fieldsDefined) {
+            String fieldId = normalizeFieldId(field);
+            if (fieldId == null) continue;
+            getOrCreateNode(fieldId, "FIELD", field.trim());
+            addEdge(copybookId, fieldId, "DEFINES", "");
+        }
+    }
+
+    /** Fields a program defines itself (own WORKING-STORAGE) and/or actually
+     * references in its PROCEDURE DIVISION logic (its own fields or ones from a
+     * copied copybook) — same purpose as {@link #registerCopybookFields}. */
+    public synchronized void registerProgramFields(String programId, List<String> fieldsDefined,
+                                                     List<String> fieldsReferenced) {
+        for (String field : fieldsDefined) {
+            String fieldId = normalizeFieldId(field);
+            if (fieldId == null) continue;
+            getOrCreateNode(fieldId, "FIELD", field.trim());
+            addEdge(programId, fieldId, "DEFINES", "");
+        }
+        for (String field : fieldsReferenced) {
+            String fieldId = normalizeFieldId(field);
+            if (fieldId == null) continue;
+            getOrCreateNode(fieldId, "FIELD", field.trim());
+            addEdge(programId, fieldId, "REFERENCES", "");
+        }
+    }
+
+    /** Normalizes a field name to its graph node id — uppercased and trimmed, so
+     * the same field name used across different programs/copybooks resolves to
+     * one shared FIELD node, which is what makes cross-program impact filtering
+     * by field name meaningful. Returns null for blank input. */
+    private String normalizeFieldId(String field) {
+        if (field == null) return null;
+        String trimmed = field.trim();
+        return trimmed.isEmpty() ? null : trimmed.toUpperCase();
+    }
+
     public synchronized void registerJclJob(String jobName, String domain, String subDomain,
                                 List<String> programsExecuted, List<String> datasetsUsed) {
         GraphNode node = getOrCreateNode(jobName, "JCL_JOB",

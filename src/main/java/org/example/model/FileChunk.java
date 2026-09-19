@@ -16,7 +16,7 @@ import java.util.List;
     "filesRead", "filesWritten", "filesUpdated", "filesDeleted",
     "copybooksReferenced", "entryPoints",
     "externalProgramsCalled", "paragraphsCalled",
-    "keyDataFields", "businessConditions",
+    "keyDataFields", "fieldsDefined", "fieldsReferenced", "businessConditions",
     "hasFileIO", "hasErrorHandling",
     "tags", "shouldEmbed", "embeddingText", "content"
 })
@@ -58,6 +58,8 @@ public class FileChunk {
     private List<String> externalProgramsCalled;
     private List<String> paragraphsCalled;
     private List<String> keyDataFields;
+    private List<String> fieldsDefined;
+    private List<String> fieldsReferenced;
     private List<String> businessConditions;
     private boolean hasFileIO;
     private boolean hasErrorHandling;
@@ -144,6 +146,12 @@ public class FileChunk {
 
     public List<String> getKeyDataFields() { return keyDataFields; }
     public void setKeyDataFields(List<String> keyDataFields) { this.keyDataFields = keyDataFields; }
+
+    public List<String> getFieldsDefined() { return fieldsDefined; }
+    public void setFieldsDefined(List<String> fieldsDefined) { this.fieldsDefined = fieldsDefined; }
+
+    public List<String> getFieldsReferenced() { return fieldsReferenced; }
+    public void setFieldsReferenced(List<String> fieldsReferenced) { this.fieldsReferenced = fieldsReferenced; }
 
     public List<String> getBusinessConditions() { return businessConditions; }
     public void setBusinessConditions(List<String> businessConditions) { this.businessConditions = businessConditions; }

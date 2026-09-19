@@ -18,6 +18,8 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Analyzes a whole source file (COBOL program, "Smart COBOL" variant, copybook,
@@ -225,6 +227,7 @@ public class LlmChunkAnalyzer {
             if (size <= windowMinLines) {
                 System.out.println("  " + label + " ... FAILED after retries — preserving raw content "
                     + "without analysis: " + e.getMessage());
+                recordPermanentFailure(fileName, e.getMessage());
                 return placeholderAnalysis(start, end, e.getMessage());
             }
             System.out.println("  " + label + " ... failed (" + e.getMessage() + "), splitting and retrying");
@@ -241,6 +244,59 @@ public class LlmChunkAnalyzer {
         ChunkAnalysis analysis = new ChunkAnalysis();
         analysis.chunks.add(placeholderSpec(start, end, reason));
         return analysis;
+    }
+
+    // -------------------------------------------------------
+    // Failure diagnostics: why windows permanently fall back to a raw,
+    // unanalyzed placeholder. Static (not instance-scoped) so counts
+    // aggregate correctly across every file/thread in a run regardless of
+    // how many LlmChunkAnalyzer instances get created. See Main's end-of-run
+    // summary — this exists because "43% of chunks are unanalyzed" was
+    // previously just a raw count with no visibility into WHY, which led to
+    // guessing at fixes instead of measuring the actual cause.
+    // -------------------------------------------------------
+
+    private static final Map<String, AtomicInteger> FAILURE_REASON_COUNTS = new ConcurrentHashMap<>();
+    private static final Map<String, AtomicInteger> FAILURE_FILE_COUNTS = new ConcurrentHashMap<>();
+
+    private static void recordPermanentFailure(String fileName, String message) {
+        FAILURE_REASON_COUNTS.computeIfAbsent(categorizeFailure(message), k -> new AtomicInteger()).incrementAndGet();
+        FAILURE_FILE_COUNTS.computeIfAbsent(fileName, k -> new AtomicInteger()).incrementAndGet();
+    }
+
+    private static String categorizeFailure(String message) {
+        if (message == null) return "unknown";
+        String m = message.toLowerCase();
+        if (m.contains("truncated")) return "truncated output (hit max_tokens)";
+        if (m.contains("malformed json")) return "malformed JSON from LLM";
+        if (m.contains("malformed http envelope")) return "malformed HTTP envelope";
+        if (m.contains("no chunks")) return "LLM returned no chunks";
+        if (m.contains("empty response")) return "LLM returned empty response";
+        if (m.contains("http 429")) return "rate limited (429), retries exhausted";
+        if (m.matches(".*http [45]\\d\\d.*")) return "OpenAI HTTP error, retries exhausted";
+        if (m.contains("http call failed")) return "network/transport failure, retries exhausted";
+        return "other: " + truncate(message, 80);
+    }
+
+    /** Printed once at the end of a run (see Main) — a reason/file breakdown of
+     * every window that permanently fell back to an unanalyzed placeholder. */
+    public static String failureSummary() {
+        if (FAILURE_REASON_COUNTS.isEmpty()) {
+            return "No permanent chunk-analysis failures this run.";
+        }
+        StringBuilder sb = new StringBuilder();
+        int total = FAILURE_REASON_COUNTS.values().stream().mapToInt(AtomicInteger::get).sum();
+        sb.append("Permanent chunk-analysis failures: ").append(total).append("\n");
+        sb.append("By reason:\n");
+        FAILURE_REASON_COUNTS.entrySet().stream()
+            .sorted((a, b) -> b.getValue().get() - a.getValue().get())
+            .forEach(e -> sb.append("  ").append(e.getValue().get()).append("  ").append(e.getKey()).append("\n"));
+        sb.append("By file (top 15):\n");
+        FAILURE_FILE_COUNTS.entrySet().stream()
+            .sorted((a, b) -> b.getValue().get() - a.getValue().get())
+            .limit(15)
+            .forEach(e -> sb.append("  ").append(e.getValue().get()).append("  ").append(e.getKey()).append("\n"));
+        return sb.toString();
     }
 
     private ChunkSpec placeholderSpec(int start, int end, String reason) {
@@ -264,6 +320,8 @@ public class LlmChunkAnalyzer {
         spec.externalProgramsCalled = List.of();
         spec.paragraphsCalled = List.of();
         spec.keyDataFields = List.of();
+        spec.fieldsDefined = List.of();
+        spec.fieldsReferenced = List.of();
         spec.businessConditions = List.of();
         spec.hasFileIO = false;
         spec.hasErrorHandling = false;
@@ -445,6 +503,8 @@ public class LlmChunkAnalyzer {
             chunk.setExternalProgramsCalled(emptyToNull(spec.externalProgramsCalled));
             chunk.setParagraphsCalled(emptyToNull(spec.paragraphsCalled));
             chunk.setKeyDataFields(emptyToNull(spec.keyDataFields));
+            chunk.setFieldsDefined(emptyToNull(spec.fieldsDefined));
+            chunk.setFieldsReferenced(emptyToNull(spec.fieldsReferenced));
             chunk.setBusinessConditions(emptyToNull(spec.businessConditions));
             chunk.setHasFileIO(spec.hasFileIO);
             chunk.setHasErrorHandling(spec.hasErrorHandling);
@@ -491,7 +551,11 @@ public class LlmChunkAnalyzer {
                 but use your judgment for the file's actual structure). division should be null for every
                 chunk. processingType should be "COPYBOOK_RECORD_LAYOUT". filesRead/filesWritten/filesUpdated/
                 filesDeleted/externalProgramsCalled/paragraphsCalled should be empty arrays. keyDataFields
-                should list the field names defined in that record.
+                should list the field names defined in that record. fieldsDefined should list every field
+                name defined in that record, not just the "key" ones — this feeds a dependency graph, so
+                completeness matters more than brevity — but cap it at the 40 most important if the record
+                genuinely has more than that. fieldsReferenced should be an empty array (copybooks have no
+                procedure logic to reference fields from).
                 """;
             case JCL -> """
                 This file is a JCL (Job Control Language) batch job stream. Segment it into a JOB header
@@ -501,7 +565,8 @@ public class LlmChunkAnalyzer {
                 (e.g. DISP=NEW/MOD); businessConditions should capture PARM= values and COND=/IF-THEN
                 conditional-execution logic as short phrases; keyDataFields may list SYSIN parameter values.
                 division can be e.g. "JOB_CARD" for the header and "JCL_STEP" for steps. processingType should
-                be "BATCH_JCL" for the header and "BATCH_JCL_STEP" for steps.
+                be "BATCH_JCL" for the header and "BATCH_JCL_STEP" for steps. fieldsDefined and
+                fieldsReferenced should be empty arrays (JCL has no COBOL data items).
                 """;
             default -> """
                 This file is expected to be a COBOL program — classic ILE COBOL, a modernized "Smart COBOL"
@@ -514,7 +579,15 @@ public class LlmChunkAnalyzer {
                 one chunk per DATA DIVISION section, and one chunk per PROCEDURE DIVISION section/paragraph/
                 batch step. filesRead/filesWritten/filesUpdated/filesDeleted are logical file names from
                 READ/WRITE/REWRITE/DELETE statements or EXEC CICS file verbs. externalProgramsCalled are
-                CALL/EXEC CICS LINK/XCTL targets. paragraphsCalled are PERFORM targets.
+                CALL/EXEC CICS LINK/XCTL targets. paragraphsCalled are PERFORM targets. For a DATA DIVISION
+                chunk, fieldsDefined should list every field name this chunk defines (every level number +
+                PIC clause / group item, not just the "key" business ones — completeness matters here since
+                this feeds a dependency graph — but cap it at the 40 most important if there are genuinely
+                more than that in one chunk); fieldsReferenced should be empty for such a chunk. For a
+                PROCEDURE DIVISION chunk, fieldsReferenced should list every field name this chunk's logic
+                actually reads, writes, or tests (MOVE/IF/COMPUTE/EVALUATE/etc. — including fields defined in
+                a copied copybook, whatever dialect the syntax is written in), same 40-field cap;
+                fieldsDefined should be empty for such a chunk unless it also declares working-storage inline.
                 """;
         };
 
@@ -569,6 +642,12 @@ public class LlmChunkAnalyzer {
                - paragraphsCalled: paragraph/section names this chunk invokes via PERFORM.
                - keyDataFields: the most important business data field names this chunk manipulates
                  (max 12, most-referenced first).
+               - fieldsDefined: every field name this chunk's DATA DIVISION defines — used to build a
+                 dependency graph, so list all of them, not just the important ones (max 40; if there are
+                 genuinely more, keep the 40 most important). Empty array if this chunk defines no data items.
+               - fieldsReferenced: every field name this chunk's PROCEDURE DIVISION logic actually reads,
+                 writes, or tests — including fields defined in a copied copybook (max 40, same rule). Empty
+                 array if this chunk has no procedure logic.
                - businessConditions: notable business rules/conditions evaluated in this chunk (max 8),
                  each as a short phrase.
                - hasFileIO: true if this chunk performs any file/database I/O.
@@ -607,6 +686,8 @@ public class LlmChunkAnalyzer {
                   "externalProgramsCalled": ["string", ...],
                   "paragraphsCalled": ["string", ...],
                   "keyDataFields": ["string", ...],
+                  "fieldsDefined": ["string", ...],
+                  "fieldsReferenced": ["string", ...],
                   "businessConditions": ["string", ...],
                   "hasFileIO": true,
                   "hasErrorHandling": false,
@@ -802,6 +883,8 @@ public class LlmChunkAnalyzer {
             spec.externalProgramsCalled = textArray(c.path("externalProgramsCalled"));
             spec.paragraphsCalled = textArray(c.path("paragraphsCalled"));
             spec.keyDataFields = textArray(c.path("keyDataFields"));
+            spec.fieldsDefined = textArray(c.path("fieldsDefined"));
+            spec.fieldsReferenced = textArray(c.path("fieldsReferenced"));
             spec.businessConditions = textArray(c.path("businessConditions"));
             spec.hasFileIO = c.path("hasFileIO").asBoolean(false);
             spec.hasErrorHandling = c.path("hasErrorHandling").asBoolean(false);
@@ -902,6 +985,8 @@ public class LlmChunkAnalyzer {
         public List<String> externalProgramsCalled;
         public List<String> paragraphsCalled;
         public List<String> keyDataFields;
+        public List<String> fieldsDefined;
+        public List<String> fieldsReferenced;
         public List<String> businessConditions;
         public boolean hasFileIO;
         public boolean hasErrorHandling;
