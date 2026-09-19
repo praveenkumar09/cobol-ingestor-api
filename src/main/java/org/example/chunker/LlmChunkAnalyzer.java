@@ -122,7 +122,7 @@ public class LlmChunkAnalyzer {
         }
 
         ChunkAnalysis merged = mergeWindowResults(results);
-        fillCoverageGaps(merged, totalLines);
+        fillCoverageGaps(merged, totalLines, fileName);
         return merged;
     }
 
@@ -258,10 +258,30 @@ public class LlmChunkAnalyzer {
 
     private static final Map<String, AtomicInteger> FAILURE_REASON_COUNTS = new ConcurrentHashMap<>();
     private static final Map<String, AtomicInteger> FAILURE_FILE_COUNTS = new ConcurrentHashMap<>();
+    private static final Map<String, AtomicInteger> GAP_FILE_COUNTS = new ConcurrentHashMap<>();
+    private static final AtomicInteger GAP_TOTAL_LINES = new AtomicInteger();
+    private static final AtomicInteger GAP_COUNT = new AtomicInteger();
 
     private static void recordPermanentFailure(String fileName, String message) {
         FAILURE_REASON_COUNTS.computeIfAbsent(categorizeFailure(message), k -> new AtomicInteger()).incrementAndGet();
         FAILURE_FILE_COUNTS.computeIfAbsent(fileName, k -> new AtomicInteger()).incrementAndGet();
+    }
+
+    /** A coverage gap — distinct from an outright analysis failure (see
+     * recordPermanentFailure): the window(s) covering this file succeeded,
+     * but the chunks the model returned still don't cover every line.
+     * Measured directly: for a single-window file (no inter-window overlap
+     * or dedup involved at all) this can ONLY come from the model's own
+     * per-window chunk list having a hole in it — confirmed as the dominant
+     * cause here (many files saw more gaps than they could possibly have
+     * window-overlap boundaries). fillCoverageGaps absorbs these into the
+     * preceding chunk rather than leaving them as contentless placeholders;
+     * tracked separately so this is visible without being conflated with
+     * real LLM-call failures. */
+    private static void recordCoverageGap(String fileName, int gapLines) {
+        GAP_FILE_COUNTS.computeIfAbsent(fileName, k -> new AtomicInteger()).incrementAndGet();
+        GAP_TOTAL_LINES.addAndGet(gapLines);
+        GAP_COUNT.incrementAndGet();
     }
 
     private static String categorizeFailure(String message) {
@@ -279,23 +299,39 @@ public class LlmChunkAnalyzer {
     }
 
     /** Printed once at the end of a run (see Main) — a reason/file breakdown of
-     * every window that permanently fell back to an unanalyzed placeholder. */
+     * every window that permanently fell back to an unanalyzed placeholder,
+     * plus separately, any merge-time coverage gaps (see recordCoverageGap). */
     public static String failureSummary() {
-        if (FAILURE_REASON_COUNTS.isEmpty()) {
-            return "No permanent chunk-analysis failures this run.";
-        }
         StringBuilder sb = new StringBuilder();
-        int total = FAILURE_REASON_COUNTS.values().stream().mapToInt(AtomicInteger::get).sum();
-        sb.append("Permanent chunk-analysis failures: ").append(total).append("\n");
-        sb.append("By reason:\n");
-        FAILURE_REASON_COUNTS.entrySet().stream()
-            .sorted((a, b) -> b.getValue().get() - a.getValue().get())
-            .forEach(e -> sb.append("  ").append(e.getValue().get()).append("  ").append(e.getKey()).append("\n"));
-        sb.append("By file (top 15):\n");
-        FAILURE_FILE_COUNTS.entrySet().stream()
-            .sorted((a, b) -> b.getValue().get() - a.getValue().get())
-            .limit(15)
-            .forEach(e -> sb.append("  ").append(e.getValue().get()).append("  ").append(e.getKey()).append("\n"));
+
+        if (FAILURE_REASON_COUNTS.isEmpty()) {
+            sb.append("No permanent chunk-analysis failures this run.\n");
+        } else {
+            int total = FAILURE_REASON_COUNTS.values().stream().mapToInt(AtomicInteger::get).sum();
+            sb.append("Permanent chunk-analysis failures: ").append(total).append("\n");
+            sb.append("By reason:\n");
+            FAILURE_REASON_COUNTS.entrySet().stream()
+                .sorted((a, b) -> b.getValue().get() - a.getValue().get())
+                .forEach(e -> sb.append("  ").append(e.getValue().get()).append("  ").append(e.getKey()).append("\n"));
+            sb.append("By file (top 15):\n");
+            FAILURE_FILE_COUNTS.entrySet().stream()
+                .sorted((a, b) -> b.getValue().get() - a.getValue().get())
+                .limit(15)
+                .forEach(e -> sb.append("  ").append(e.getValue().get()).append("  ").append(e.getKey()).append("\n"));
+        }
+
+        if (GAP_COUNT.get() == 0) {
+            sb.append("No merge-time coverage gaps this run.\n");
+        } else {
+            sb.append("Merge-time coverage gaps: ").append(GAP_COUNT.get())
+                .append(" (").append(GAP_TOTAL_LINES.get()).append(" total lines)\n");
+            sb.append("By file (top 15):\n");
+            GAP_FILE_COUNTS.entrySet().stream()
+                .sorted((a, b) -> b.getValue().get() - a.getValue().get())
+                .limit(15)
+                .forEach(e -> sb.append("  ").append(e.getValue().get()).append("  ").append(e.getKey()).append("\n"));
+        }
+
         return sb.toString();
     }
 
@@ -375,12 +411,13 @@ public class LlmChunkAnalyzer {
     private static final int OVERLAP_FUZZ_TOLERANCE_LINES = 10;
 
     /**
-     * Drops a chunk whose line range substantially overlaps an already-kept
-     * one — the signature of the same region being analyzed independently by
-     * two different (adjacent, overlapping) windows. Real, distinct semantic
-     * units from a single coherent analysis don't overlap each other at all;
-     * any overlap beyond a small boundary-fuzz tolerance means duplication,
-     * not two legitimately different chunks that happen to share a few lines.
+     * Drops (or trims — see below) a chunk whose line range substantially
+     * overlaps an already-kept one — the signature of the same region being
+     * analyzed independently by two different (adjacent, overlapping)
+     * windows. Real, distinct semantic units from a single coherent analysis
+     * don't overlap each other at all; any overlap beyond a small
+     * boundary-fuzz tolerance means duplication, not two legitimately
+     * different chunks that happen to share a few lines.
      *
      * <p>Compares against the SMALLER of the two chunks' own lengths (not just
      * the candidate's) — using only the candidate's length here misses a real
@@ -391,11 +428,30 @@ public class LlmChunkAnalyzer {
      * the small chunk — a duplicate either way you look at it). This
      * asymmetry is what let duplicate/overlapping chunks for the same file
      * region survive into storage undetected.
+     *
+     * <p><b>Trim, don't just drop.</b> A candidate can legitimately extend
+     * PAST the kept chunk it overlaps with — e.g. window overlap zones are
+     * {@code windowOverlapLines} wide, but nothing stops the two windows'
+     * own chunk boundaries inside that zone from landing differently, so a
+     * candidate can straddle the kept chunk's end and reach into territory
+     * the kept chunk never covered at all. Dropping such a candidate
+     * wholesale used to throw that unique tail away too, and it would then
+     * surface as an entirely un-analyzed "coverage gap" placeholder
+     * downstream (see fillCoverageGaps) — accounting for a large share of
+     * this ingestor's unanalyzed-chunk rate, confirmed by seeing that rate
+     * stay high even on runs with zero actual analysis failures. Instead,
+     * when the candidate's unique tail beyond the kept chunk is itself
+     * bigger than the fuzz tolerance, keep just that tail (trimming its
+     * lineStart forward) rather than discarding the whole chunk. Its
+     * LLM-written metadata (sectionPurpose, keyDataFields, etc.) still
+     * describes the chunk's original, untrimmed range, which may not
+     * perfectly fit the trimmed remainder alone — an acceptable approximation
+     * given the alternative is that content having no metadata at all.
      */
     private List<ChunkSpec> dedupOverlaps(List<ChunkSpec> sorted) {
         List<ChunkSpec> kept = new ArrayList<>();
-        for (ChunkSpec c : sorted) {
-            int cLen = c.lineEnd - c.lineStart + 1;
+        for (ChunkSpec original : sorted) {
+            ChunkSpec c = original;
             boolean isDuplicate = false;
             for (ChunkSpec k : kept) {
                 int overlapStart = Math.max(c.lineStart, k.lineStart);
@@ -403,12 +459,18 @@ public class LlmChunkAnalyzer {
                 int overlapLen   = overlapEnd - overlapStart + 1;
                 if (overlapLen <= OVERLAP_FUZZ_TOLERANCE_LINES) continue;
 
+                int cLen = c.lineEnd - c.lineStart + 1;
                 int kLen = k.lineEnd - k.lineStart + 1;
                 int smallerLen = Math.min(cLen, kLen);
-                if (overlapLen >= smallerLen * 0.5) {
-                    isDuplicate = true;
-                    break;
+                if (overlapLen < smallerLen * 0.5) continue;
+
+                int uniqueTail = c.lineEnd - k.lineEnd;
+                if (uniqueTail > OVERLAP_FUZZ_TOLERANCE_LINES) {
+                    c.lineStart = k.lineEnd + 1;
+                    continue; // re-check the trimmed remainder against the other kept chunks
                 }
+                isDuplicate = true;
+                break;
             }
             if (!isDuplicate) kept.add(c);
         }
@@ -420,21 +482,56 @@ public class LlmChunkAnalyzer {
      * with a placeholder chunk. Guarantees every line belongs to some chunk
      * even if a bug elsewhere in merge/dedup dropped a slice.
      */
-    private void fillCoverageGaps(ChunkAnalysis merged, int totalLines) {
+    /**
+     * Final safety net: after merging, every line in 1..totalLines must
+     * belong to some chunk. Most such gaps turn out to be small holes the
+     * model left BETWEEN two chunks it otherwise analyzed just fine (a
+     * skipped blank/comment line, a paragraph boundary it didn't assign to
+     * either neighbor) — not a real analysis failure — so a gap with a real
+     * chunk immediately before it gets absorbed into that chunk (extending
+     * its lineEnd) rather than spawning a separate, contentless "unanalyzed"
+     * placeholder. Its LLM-written metadata (sectionPurpose, keyDataFields,
+     * etc.) was written for its original, smaller range and may not
+     * perfectly describe the few absorbed lines too — an acceptable
+     * approximation given the alternative is that content having no
+     * metadata at all. A gap with no preceding chunk (i.e. right at the very
+     * start of the file — in practice, usually the model skipping past
+     * IDENTIFICATION-DIVISION-style header boilerplate before its first real
+     * chunk) is handled symmetrically: absorbed forward into the FIRST
+     * chunk by pulling its lineStart back to 1, rather than spawning a
+     * placeholder for just those first few lines. The only case that can
+     * still fall through to an actual placeholder is a file with zero
+     * chunks at all, which existing checks elsewhere already treat as a
+     * hard failure before this method is ever reached.
+     */
+    private void fillCoverageGaps(ChunkAnalysis merged, int totalLines, String fileName) {
         merged.chunks.sort(Comparator.comparingInt(c -> c.lineStart));
-        List<ChunkSpec> gaps = new ArrayList<>();
+        List<ChunkSpec> leadingGaps = new ArrayList<>();
         int cursor = 1;
+        ChunkSpec previous = null;
         for (ChunkSpec c : merged.chunks) {
             if (c.lineStart > cursor) {
-                gaps.add(placeholderSpec(cursor, c.lineStart - 1, "merge produced a coverage gap"));
+                int gapEnd = c.lineStart - 1;
+                recordCoverageGap(fileName, gapEnd - cursor + 1);
+                if (previous != null) {
+                    previous.lineEnd = gapEnd;
+                } else {
+                    c.lineStart = cursor;
+                }
             }
             cursor = Math.max(cursor, c.lineEnd + 1);
+            previous = c;
         }
         if (cursor <= totalLines) {
-            gaps.add(placeholderSpec(cursor, totalLines, "merge produced a trailing coverage gap"));
+            recordCoverageGap(fileName, totalLines - cursor + 1);
+            if (previous != null) {
+                previous.lineEnd = totalLines;
+            } else {
+                leadingGaps.add(placeholderSpec(cursor, totalLines, "merge produced a trailing coverage gap"));
+            }
         }
-        if (!gaps.isEmpty()) {
-            merged.chunks.addAll(gaps);
+        if (!leadingGaps.isEmpty()) {
+            merged.chunks.addAll(leadingGaps);
             merged.chunks.sort(Comparator.comparingInt(c -> c.lineStart));
         }
     }
@@ -619,7 +716,12 @@ public class LlmChunkAnalyzer {
             2. Split the shown lines into an ORDERED list of non-overlapping chunks that each represent one
                coherent unit. Merge trivial fragments; split any unit larger than ~200 lines at a natural
                sub-boundary. Every line shown must belong to some chunk — including a partial unit at the
-               very start or end of this excerpt if the excerpt begins or ends mid-structure.
+               very start or end of this excerpt if the excerpt begins or ends mid-structure, and including
+               blank lines, comment-only lines, and lines between paragraphs that don't feel like they
+               belong to either neighbor — attribute those to whichever adjacent chunk they're physically
+               closer to rather than omitting them. The chunks must be perfectly CONTIGUOUS as well as
+               non-overlapping: chunk N's lineEnd + 1 must exactly equal chunk N+1's lineStart, with no
+               unaccounted-for lines anywhere between the first and last chunk, not just at the ends.
             3. For EACH chunk, decide every one of these values yourself, based only on that chunk's code
                and the file-level context above:
                - division: enclosing structural unit if applicable, else null.
@@ -656,7 +758,8 @@ public class LlmChunkAnalyzer {
                  capability words, "file-io"/"error-handling"/"batch"/"cics" as applicable).
 
             IMPORTANT: cover every line shown, from the first line number to the last line number in the
-            source above, with chunks — do not stop early.
+            source above, with chunks — do not stop early, and do not leave any gap BETWEEN chunks either;
+            re-check that each chunk's lineEnd + 1 equals the next chunk's lineStart before responding.
 
             OUTPUT — respond with ONLY a single JSON object, no markdown fences, no commentary, matching
             exactly this shape:
