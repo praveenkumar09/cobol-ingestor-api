@@ -73,6 +73,21 @@ public class VectorStore implements AutoCloseable {
     }
 
     /**
+     * Deletes all existing rows, so a re-run starts from a clean slate instead of
+     * upserting onto (and potentially leaving stale rows from) a previous run's data.
+     */
+    public void clearAll() throws SQLException {
+        try (Statement st = conn.createStatement()) {
+            int deleted = st.executeUpdate("DELETE FROM chunks");
+            conn.commit();
+            System.out.println("    Cleared " + deleted + " existing chunk row(s)");
+        } catch (SQLException e) {
+            conn.rollback();
+            throw e;
+        }
+    }
+
+    /**
      * Inserts all chunks in a single transaction.
      * embeddingMap: chunk_id → float[] vector (null if not embedded).
      */

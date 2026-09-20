@@ -162,6 +162,8 @@ public class ResumeIngestionFromChunks {
     private static void storeToVectorDB(List<FileChunk> allChunks, Map<String, float[]> embeddingMap) {
         System.out.println("\n--- Storing to PostgreSQL (pgvector) ---");
         try (VectorStore store = VectorStore.create()) {
+            System.out.println("    Clearing existing chunks/embeddings...");
+            store.clearAll();
             store.upsertChunks(allChunks, embeddingMap);
             System.out.println("  ✓ " + allChunks.size() + " chunks stored");
             System.out.println("    pgAdmin → http://localhost:5050");
