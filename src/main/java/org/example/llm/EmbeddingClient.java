@@ -56,9 +56,14 @@ public class EmbeddingClient {
     public List<float[]> embedBatch(List<String> texts) throws Exception {
         if (texts.isEmpty()) return List.of();
 
+        // "dimensions" projects text-embedding-3-{small,large} down to DIMS
+        // (default 1536) so the output always matches the pgvector column's
+        // fixed size, regardless of a model's native output size (e.g.
+        // text-embedding-3-large natively returns 3072).
         Map<String, Object> body = Map.of(
             "model", model,
-            "input", texts
+            "input", texts,
+            "dimensions", DIMS
         );
 
         HttpRequest request = HttpRequest.newBuilder()
