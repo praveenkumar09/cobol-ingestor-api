@@ -39,7 +39,7 @@ public class EmbeddingClient {
 
     /** Returns null when OPENAI_API_KEY is absent — callers skip embedding. */
     public static EmbeddingClient create() {
-        String key = System.getenv("OPENAI_API_KEY");
+        String key = AppConfig.getenv("OPENAI_API_KEY");
         if (key == null || key.isBlank()) return null;
         String m   = System.getenv("OPENAI_EMBED_MODEL");
         String url = AppConfig.get("openai.embed.url", "https://api.openai.com/v1/embeddings");

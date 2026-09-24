@@ -51,6 +51,11 @@ CREATE TABLE IF NOT EXISTS chunks (
     -- Vector embedding (text-embedding-3-small = 1536 dims)
     embedding             vector(1536),
 
+    -- Full-text search over raw code, for hybrid (vector + keyword) retrieval
+    -- (see cobalt-rag-api's VectorSearchService). 'simple' config — no
+    -- stemming/stopwords, which would mangle hyphenated COBOL identifiers.
+    content_tsv           tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(content, ''))) STORED,
+
     created_at            TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -80,6 +85,9 @@ CREATE INDEX IF NOT EXISTS idx_chunks_payload       ON chunks USING gin (payload
 
 -- ── source_file index (for incremental delete before re-processing a file) ──
 CREATE INDEX IF NOT EXISTS idx_chunks_source_file ON chunks (source_file);
+
+-- ── Full-text (keyword) search index, for hybrid vector+keyword retrieval ───
+CREATE INDEX IF NOT EXISTS idx_chunks_content_tsv ON chunks USING gin (content_tsv);
 
 -- ── Ingestion audit log ──────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS ingestion_runs (

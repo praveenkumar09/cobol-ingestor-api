@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.example.graph.KnowledgeGraph;
 import org.example.llm.EmbeddingClient;
+import org.example.llm.EmbeddingDocumentBuilder;
 import org.example.model.FileChunk;
 import org.example.store.GraphStore;
 import org.example.store.VectorStore;
@@ -48,6 +49,14 @@ public class ResumeIngestionFromChunks {
             System.out.println("  Nothing to embed — exiting.");
             return;
         }
+
+        // Rebuild embeddingText from each chunk's already-present content +
+        // metadata via the CURRENT EmbeddingDocumentBuilder, rather than reusing
+        // whatever embeddingText was baked into the JSON at original-analysis
+        // time — this is what lets an EmbeddingDocumentBuilder change (e.g. the
+        // hybrid metadata+code-excerpt text) apply to the full existing corpus
+        // via a cheap embed-only run, with no chunk-analysis LLM cost.
+        EmbeddingDocumentBuilder.process(allChunks);
 
         // ── Embeddings ───────────────────────────────────────────────────
         EmbeddingClient embedder = EmbeddingClient.create();

@@ -1,5 +1,6 @@
 package org.example;
 
+import org.example.chunker.BatchChunkAnalysisService;
 import org.example.chunker.CobolChunker;
 import org.example.chunker.JclChunker;
 import org.example.chunker.LlmChunkAnalyzer;
@@ -9,9 +10,11 @@ import org.example.graph.GraphHtmlExporter;
 import org.example.graph.GraphWriter;
 import org.example.graph.KnowledgeGraph;
 import org.example.graph.KnowledgeGraphBuilder;
+import org.example.llm.BatchEnrichmentService;
 import org.example.llm.EmbeddingClient;
 import org.example.llm.EmbeddingDocumentBuilder;
 import org.example.llm.LlmEnricher;
+import org.example.llm.OpenAiBatchClient;
 import org.example.model.FileChunk;
 import org.example.model.FileType;
 import org.example.store.AuditLog;
@@ -23,18 +26,36 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
 public class Main {
 
-    // Files are processed in fixed-size parallel batches: PARALLELISM files run
-    // concurrently, the batch is fully awaited, then the next batch starts.
+    // How many small files' LLM chunk-analysis calls are allowed IN FLIGHT at
+    // once — the real ceiling here is OpenAI's rate limit for your account/tier
+    // (RPM/TPM), not JVM thread cost, since these are cheap virtual threads
+    // (see runConcurrently). OpenAI no longer publishes exact per-tier RPM/TPM
+    // numbers for a given model in its public docs (checked directly) — verify
+    // your account's real numbers at platform.openai.com/settings/organization/
+    // limits, or read the x-ratelimit-limit-requests/x-ratelimit-limit-tokens
+    // response headers from one live call.
+    //
+    // 5 is deliberately conservative, NOT a raised default — a live test at 10
+    // concurrent (this constant's old default) produced sustained "OpenAI HTTP
+    // 429" errors across MULTIPLE simultaneously-started files, several of
+    // which exhausted all retry attempts and fell back to unanalyzed
+    // placeholders (real data loss, not just slowness). That result overrides
+    // the earlier guess that 10-15 would be safely under a typical paid tier's
+    // headroom — this account's real limit is evidently lower. Raise this only
+    // after confirming real headroom via the dashboard/response-headers above.
     private static final int PARALLELISM =
-        AppConfig.getInt("INGEST_PARALLELISM", "ingest.parallelism", 10);
+        AppConfig.getInt("INGEST_PARALLELISM", "ingest.parallelism", 5);
 
     // A file over this many lines needs multiple LLM chunking windows — see
     // processFilesTiered below for why these are pulled out of the fast
@@ -47,6 +68,12 @@ public class Main {
         final AtomicInteger files  = new AtomicInteger();
         final AtomicInteger chunks = new AtomicInteger();
     }
+
+    /** One discovered, not-yet-processed file — used only by the batch-mode
+     * orchestration (see runBatchOrchestration), which needs every source's
+     * files gathered up front (Phase A0) before tiering/processing any of
+     * them, unlike the legacy per-source processFlat/processFilesTiered flow. */
+    private record DiscoveredFile(Path file, String displayName, FileType cpyTypeHint) {}
 
     public static void main(String[] args) {
         System.out.println("============================================");
@@ -139,44 +166,21 @@ public class Main {
             System.out.println("  Continuing with locally cached files (if any)...");
         }
 
-        // ── Local insurance files (flat directory scan) ───────────────
-        processFlat(inputRoot.resolve("copybooks"), FileType.COPYBOOK,
-            cobolChunker, null, "INSURANCE COPYBOOKS",
-            graphBuilder, writer, outputDir, counters, enricher, allChunks);
-        processFlat(inputRoot.resolve("cobol"), FileType.COBOL_PROGRAM,
-            cobolChunker, null, "INSURANCE COBOL",
-            graphBuilder, writer, outputDir, counters, enricher, allChunks);
-        processFlat(inputRoot.resolve("jcl"), null,
-            null, jclChunker, "INSURANCE JCL",
-            graphBuilder, writer, outputDir, counters, enricher, allChunks);
+        // ── Chunk-analysis: batch (structural rate-limit fix) or legacy synchronous ──
+        boolean useBatchApi = AppConfig.getBoolean("INGEST_USE_BATCH_API", "ingest.use-batch-api", true);
+        OpenAiBatchClient batchClient = useBatchApi ? OpenAiBatchClient.create() : null;
+        System.out.println("  Batch API      : " + (batchClient != null
+            ? "ENABLED (structural rate-limit fix — separate queue, ~24h completion window)"
+            : "DISABLED" + (useBatchApi ? " (set OPENAI_API_KEY to enable)" : " (ingest.use-batch-api=false)")));
 
-        // ── Remote source: recursive traversal ───────────────────────
-        if (Files.exists(cardDemoRoot)) {
-            System.out.println("\n--- Processing: REMOTE SOURCE — " + cacheDirName + " (recursive) ---");
-            try {
-                List<Path> cardFiles;
-                try (Stream<Path> walk = Files.walk(cardDemoRoot)) {
-                    cardFiles = walk
-                        .filter(Files::isRegularFile)
-                        .filter(p -> {
-                            String ext = getExtension(p.getFileName().toString()).toLowerCase();
-                            return ext.equals("cbl") || ext.equals("cpy") || ext.equals("jcl");
-                        })
-                        .sorted(Comparator.comparing((Path p) -> {
-                            String ext = getExtension(p.getFileName().toString()).toLowerCase();
-                            return switch (ext) { case "cpy" -> "1"; case "cbl" -> "2"; default -> "3"; };
-                        }).thenComparing(p -> p.getFileName().toString()))
-                        .toList();
-                }
-                System.out.println("  Found " + cardFiles.size() + " source files");
-
-                processFilesTiered(cardFiles, file -> processOneFile(
-                    file, cardDemoRoot.relativize(file).toString(), FileType.COPYBOOK,
-                    cobolChunker, jclChunker, graphBuilder, writer, outputDir,
-                    counters, enricher, allChunks));
-            } catch (IOException e) {
-                System.out.println("ERROR walking source: " + e.getMessage());
-            }
+        if (batchClient != null && chunkAnalyzer != null) {
+            runBatchOrchestration(inputRoot, cardDemoRoot, cacheDirName, chunkAnalyzer,
+                cobolChunker, jclChunker, batchClient, graphBuilder, writer, outputDir,
+                counters, enricher, allChunks);
+        } else {
+            runLegacyOrchestration(inputRoot, cardDemoRoot, cacheDirName,
+                cobolChunker, jclChunker, graphBuilder, writer, outputDir,
+                counters, enricher, allChunks);
         }
 
         // ── Knowledge Graph — JSON + HTML ─────────────────────────────
@@ -297,6 +301,247 @@ public class Main {
         }
     }
 
+    // ─── Legacy orchestration: today's proven, fully-synchronous flow, ────────
+    // ─── unchanged — selected when ingest.use-batch-api=false or no API key ──
+
+    private static void runLegacyOrchestration(Path inputRoot, Path cardDemoRoot, String cacheDirName,
+                                                CobolChunker cobolChunker, JclChunker jclChunker,
+                                                KnowledgeGraphBuilder graphBuilder, ChunkWriter writer,
+                                                Path outputDir, Counters counters, LlmEnricher enricher,
+                                                List<FileChunk> allChunks) {
+        // ── Local insurance files (flat directory scan) ───────────────
+        processFlat(inputRoot.resolve("copybooks"), FileType.COPYBOOK,
+            cobolChunker, null, "INSURANCE COPYBOOKS",
+            graphBuilder, writer, outputDir, counters, enricher, allChunks);
+        processFlat(inputRoot.resolve("cobol"), FileType.COBOL_PROGRAM,
+            cobolChunker, null, "INSURANCE COBOL",
+            graphBuilder, writer, outputDir, counters, enricher, allChunks);
+        processFlat(inputRoot.resolve("jcl"), null,
+            null, jclChunker, "INSURANCE JCL",
+            graphBuilder, writer, outputDir, counters, enricher, allChunks);
+
+        // ── Remote source: recursive traversal ───────────────────────
+        if (Files.exists(cardDemoRoot)) {
+            System.out.println("\n--- Processing: REMOTE SOURCE — " + cacheDirName + " (recursive) ---");
+            try {
+                List<Path> cardFiles;
+                try (Stream<Path> walk = Files.walk(cardDemoRoot)) {
+                    cardFiles = walk
+                        .filter(Files::isRegularFile)
+                        .filter(p -> {
+                            String ext = getExtension(p.getFileName().toString()).toLowerCase();
+                            return ext.equals("cbl") || ext.equals("cpy") || ext.equals("jcl");
+                        })
+                        .sorted(Comparator.comparing((Path p) -> {
+                            String ext = getExtension(p.getFileName().toString()).toLowerCase();
+                            return switch (ext) { case "cpy" -> "1"; case "cbl" -> "2"; default -> "3"; };
+                        }).thenComparing(p -> p.getFileName().toString()))
+                        .toList();
+                }
+                System.out.println("  Found " + cardFiles.size() + " source files");
+
+                processFilesTiered(cardFiles, file -> processOneFile(
+                    file, cardDemoRoot.relativize(file).toString(), FileType.COPYBOOK,
+                    cobolChunker, jclChunker, graphBuilder, writer, outputDir,
+                    counters, enricher, allChunks));
+            } catch (IOException e) {
+                System.out.println("ERROR walking source: " + e.getMessage());
+            }
+        }
+    }
+
+    // ─── Batch-mode orchestration ──────────────────────────────────────────────
+    // Phase A0: discover every source's files up front, tier globally.
+    // Phase A1: background batch chunk-analysis for small (single-window) files,
+    //           concurrently with synchronous large-file chunking on the main
+    //           thread; join, falling back to synchronous chunk() per small
+    //           file that the batch pass didn't succeed on.
+    // Phase B:  one enrichment batch pass over every file's chunks together.
+    // Phase C:  unchanged tail — embedding-doc build, write, aggregate.
+
+    private static void runBatchOrchestration(Path inputRoot, Path cardDemoRoot, String cacheDirName,
+                                               LlmChunkAnalyzer chunkAnalyzer, CobolChunker cobolChunker,
+                                               JclChunker jclChunker, OpenAiBatchClient batchClient,
+                                               KnowledgeGraphBuilder graphBuilder, ChunkWriter writer,
+                                               Path outputDir, Counters counters, LlmEnricher enricher,
+                                               List<FileChunk> allChunks) {
+        // Phase A0: discovery only — no chunking yet.
+        List<DiscoveredFile> discovered = new ArrayList<>();
+        discovered.addAll(listFlatDiscovered(inputRoot.resolve("copybooks"), FileType.COPYBOOK, "INSURANCE COPYBOOKS"));
+        discovered.addAll(listFlatDiscovered(inputRoot.resolve("cobol"), FileType.COBOL_PROGRAM, "INSURANCE COBOL"));
+        discovered.addAll(listFlatDiscovered(inputRoot.resolve("jcl"), null, "INSURANCE JCL"));
+
+        if (Files.exists(cardDemoRoot)) {
+            System.out.println("\n--- Discovering: REMOTE SOURCE — " + cacheDirName + " (recursive) ---");
+            try {
+                List<Path> cardFiles;
+                try (Stream<Path> walk = Files.walk(cardDemoRoot)) {
+                    cardFiles = walk
+                        .filter(Files::isRegularFile)
+                        .filter(p -> {
+                            String ext = getExtension(p.getFileName().toString()).toLowerCase();
+                            return ext.equals("cbl") || ext.equals("cpy") || ext.equals("jcl");
+                        })
+                        .sorted(Comparator.comparing((Path p) -> {
+                            String ext = getExtension(p.getFileName().toString()).toLowerCase();
+                            return switch (ext) { case "cpy" -> "1"; case "cbl" -> "2"; default -> "3"; };
+                        }).thenComparing(p -> p.getFileName().toString()))
+                        .toList();
+                }
+                System.out.println("  Found " + cardFiles.size() + " source files");
+                for (Path f : cardFiles) {
+                    discovered.add(new DiscoveredFile(f, cardDemoRoot.relativize(f).toString(), FileType.COPYBOOK));
+                }
+            } catch (IOException e) {
+                System.out.println("ERROR walking source: " + e.getMessage());
+            }
+        }
+
+        if (discovered.isEmpty()) {
+            System.out.println("  No files discovered — nothing to do.");
+            return;
+        }
+
+        List<DiscoveredFile> small = new ArrayList<>();
+        List<DiscoveredFile> large = new ArrayList<>();
+        for (DiscoveredFile d : discovered) {
+            if (countLines(d.file()) > LARGE_FILE_THRESHOLD_LINES) large.add(d); else small.add(d);
+        }
+        System.out.println("\n--- Batch-mode ingestion: " + discovered.size() + " file(s) total ("
+            + small.size() + " small / " + large.size() + " large) ---");
+
+        // Phase A1a (background): submit + poll the small-file batch chunk-analysis pass.
+        ExecutorService batchExecutor = Executors.newSingleThreadExecutor();
+        Future<Map<Path, LlmChunkAnalyzer.ChunkAnalysis>> batchFuture = batchExecutor.submit(() -> {
+            List<BatchChunkAnalysisService.SmallFileTask> tasks = new ArrayList<>();
+            for (DiscoveredFile d : small) {
+                String ext = getExtension(d.file().getFileName().toString()).toLowerCase();
+                FileType ft = resolvedFileType(ext, d.cpyTypeHint());
+                if (ft == null) continue; // unsupported extension — chunkOnly's own switch will no-op it too
+                List<String> lines;
+                try { lines = Files.readAllLines(d.file()); }
+                catch (IOException e) { continue; } // unreadable — falls back to chunkOnly below, which will hit + report the same error
+                tasks.add(new BatchChunkAnalysisService.SmallFileTask(d.file(), d.displayName(), ft, lines));
+            }
+            BatchChunkAnalysisService svc = new BatchChunkAnalysisService(chunkAnalyzer, batchClient, outputDir);
+            return svc.analyzeAll(tasks);
+        });
+
+        // Phase A1b (main thread, concurrent with the above): large files,
+        // synchronously and one at a time — unchanged rationale from
+        // processFilesTiered. Chunking only; enrichment happens together with
+        // every other file's chunks in Phase B below.
+        Map<Path, List<FileChunk>> resultsByFile = Collections.synchronizedMap(new LinkedHashMap<>());
+        List<Path> largePaths = new ArrayList<>(large.size());
+        Map<Path, DiscoveredFile> largeByPath = new HashMap<>();
+        for (DiscoveredFile d : large) { largePaths.add(d.file()); largeByPath.put(d.file(), d); }
+        runInBatches(largePaths, 1, file -> {
+            DiscoveredFile d = largeByPath.get(file);
+            resultsByFile.put(file, chunkOnly(file, d.displayName(), d.cpyTypeHint(), cobolChunker, jclChunker, graphBuilder, counters));
+        });
+
+        // Join.
+        Map<Path, LlmChunkAnalyzer.ChunkAnalysis> batchSuccess;
+        try {
+            batchSuccess = batchFuture.get();
+        } catch (Exception e) {
+            System.out.println("  WARNING: batch chunk-analysis phase failed entirely (" + e.getMessage()
+                + ") — all " + small.size() + " small file(s) fall back to synchronous analysis");
+            batchSuccess = Map.of();
+        } finally {
+            batchExecutor.shutdown();
+        }
+
+        for (DiscoveredFile d : small) {
+            Path file = d.file();
+            LlmChunkAnalyzer.ChunkAnalysis analysis = batchSuccess.get(file);
+            List<FileChunk> chunks = null;
+            if (analysis != null) {
+                String ext = getExtension(file.getFileName().toString()).toLowerCase();
+                try {
+                    List<String> lines = Files.readAllLines(file);
+                    chunks = switch (ext) {
+                        case "cbl" -> cobolChunker.fromAnalysis(d.displayName(), FileType.COBOL_PROGRAM, lines, analysis, graphBuilder);
+                        case "cpy" -> cobolChunker.fromAnalysis(d.displayName(), d.cpyTypeHint(), lines, analysis, graphBuilder);
+                        case "jcl" -> jclChunker.fromAnalysis(d.displayName(), lines, analysis, graphBuilder);
+                        default -> List.of();
+                    };
+                    if (chunks.isEmpty()) {
+                        System.out.println("  " + d.displayName() + " ... 0 chunks");
+                    } else {
+                        counters.files.incrementAndGet();
+                        counters.chunks.addAndGet(chunks.size());
+                        System.out.println("  " + d.displayName() + " ... " + chunks.size() + " chunks (batch)");
+                    }
+                } catch (Exception e) {
+                    System.out.println("  " + d.displayName()
+                        + " ... post-analysis ERROR, falling back to synchronous: " + e.getMessage());
+                    chunks = null;
+                }
+            }
+            if (chunks == null) {
+                chunks = chunkOnly(file, d.displayName(), d.cpyTypeHint(), cobolChunker, jclChunker, graphBuilder, counters);
+            }
+            resultsByFile.put(file, chunks);
+        }
+
+        // Phase B: one enrichment batch pass over every file's chunks together.
+        List<FileChunk> everything = new ArrayList<>();
+        for (List<FileChunk> chunks : resultsByFile.values()) everything.addAll(chunks);
+
+        if (enricher != null && !everything.isEmpty()) {
+            new BatchEnrichmentService(enricher, batchClient, outputDir).enrichAll(everything);
+        }
+
+        // Phase C: unchanged tail — embedding-doc build, write, aggregate.
+        for (Map.Entry<Path, List<FileChunk>> entry : resultsByFile.entrySet()) {
+            List<FileChunk> chunks = entry.getValue();
+            if (chunks.isEmpty()) continue;
+            EmbeddingDocumentBuilder.process(chunks);
+            try {
+                writer.writeChunks(chunks, outputDir, entry.getKey().getFileName().toString());
+            } catch (IOException e) {
+                System.out.println("  " + entry.getKey().getFileName() + " ... WRITE ERROR: " + e.getMessage());
+                continue;
+            }
+            allChunks.addAll(chunks);
+        }
+    }
+
+    private static List<DiscoveredFile> listFlatDiscovered(Path dir, FileType cpyTypeHint, String label) {
+        List<DiscoveredFile> result = new ArrayList<>();
+        if (!Files.exists(dir)) return result;
+        System.out.println("\n--- Discovering: " + label + " ---");
+
+        List<Path> files;
+        try (Stream<Path> stream = Files.list(dir)) {
+            files = stream.filter(Files::isRegularFile)
+                .sorted(Comparator.comparing(p -> p.getFileName().toString()))
+                .toList();
+        } catch (IOException e) {
+            System.out.println("ERROR listing " + dir + ": " + e.getMessage());
+            return result;
+        }
+
+        System.out.println("  Found " + files.size() + " file(s)");
+        for (Path f : files) result.add(new DiscoveredFile(f, f.getFileName().toString(), cpyTypeHint));
+        return result;
+    }
+
+    /** Mirrors processOneFile/chunkOnly's extension switch — the only place
+     * that decides which FileType a file's whole-file batch prompt is built
+     * with, kept as its own method so it can never silently drift from that
+     * switch. Null means "not a chunkable extension," same as chunkOnly's
+     * switch default. */
+    private static FileType resolvedFileType(String ext, FileType cpyTypeHint) {
+        return switch (ext) {
+            case "cbl" -> FileType.COBOL_PROGRAM;
+            case "cpy" -> cpyTypeHint;
+            case "jcl" -> FileType.JCL;
+            default -> null;
+        };
+    }
+
     // ─── processFlat ───────────────────────────────────────────────────────────
 
     private static void processFlat(Path dir, FileType cobolType,
@@ -335,8 +580,33 @@ public class Main {
                                         KnowledgeGraphBuilder graphBuilder, ChunkWriter writer,
                                         Path outputDir, Counters counters, LlmEnricher enricher,
                                         List<FileChunk> allChunks) {
-        String fileName = file.getFileName().toString();
-        String ext = getExtension(fileName).toLowerCase();
+        List<FileChunk> chunks = chunkOnly(file, displayName, cpyTypeHint, cobolChunker, jclChunker, graphBuilder, counters);
+        if (chunks.isEmpty()) return;
+
+        if (enricher != null) enricher.enrichChunks(chunks);
+        EmbeddingDocumentBuilder.process(chunks);
+
+        try {
+            writer.writeChunks(chunks, outputDir, file.getFileName().toString());
+        } catch (IOException e) {
+            System.out.println("  " + displayName + " ... WRITE ERROR: " + e.getMessage());
+            return;
+        }
+
+        allChunks.addAll(chunks);
+    }
+
+    /** The chunking-only half of the old processOneFile — shared by the
+     * legacy synchronous path above, the batch-mode large-file loop, and the
+     * batch-mode small-file fallback (see runBatchOrchestration), so all
+     * three ways a file can end up chunked go through byte-for-byte the same
+     * dispatch/logging/counting logic. Enrichment, embedding-doc building,
+     * and writing are each caller's own concern — batch mode defers
+     * enrichment to one combined pass over every file's chunks (Phase B). */
+    private static List<FileChunk> chunkOnly(Path file, String displayName, FileType cpyTypeHint,
+                                              CobolChunker cobolChunker, JclChunker jclChunker,
+                                              KnowledgeGraphBuilder graphBuilder, Counters counters) {
+        String ext = getExtension(file.getFileName().toString()).toLowerCase();
 
         List<FileChunk> chunks;
         try {
@@ -351,28 +621,18 @@ public class Main {
             };
         } catch (Exception e) {
             System.out.println("  " + displayName + " ... ERROR: " + e.getMessage());
-            return;
+            return List.of();
         }
 
         if (chunks.isEmpty()) {
             System.out.println("  " + displayName + " ... 0 chunks");
-            return;
+            return chunks;
         }
 
-        if (enricher != null) enricher.enrichChunks(chunks);
-        EmbeddingDocumentBuilder.process(chunks);
-
-        try {
-            writer.writeChunks(chunks, outputDir, fileName);
-        } catch (IOException e) {
-            System.out.println("  " + displayName + " ... WRITE ERROR: " + e.getMessage());
-            return;
-        }
-
-        allChunks.addAll(chunks);
         counters.files.incrementAndGet();
         counters.chunks.addAndGet(chunks.size());
         System.out.println("  " + displayName + " ... " + chunks.size() + " chunks");
+        return chunks;
     }
 
     // ─── Tiered scheduling: small files fast/parallel, large files careful/solo ─
@@ -402,7 +662,7 @@ public class Main {
                 + " lines set aside for careful, one-at-a-time processing after the fast batch below");
         }
 
-        runInBatches(small, PARALLELISM, task);
+        runConcurrently(small, PARALLELISM, task);
         runInBatches(large, 1, task);
     }
 
@@ -414,12 +674,89 @@ public class Main {
         }
     }
 
-    // ─── Batched parallel execution: N files at a time ─────────────────────────
-    // Runs each batch fully in parallel on a fixed-size pool, then blocks
-    // (invokeAll) until the whole batch finishes before starting the next
-    // batch — matching "N in parallel, then the next N" exactly. Called with
-    // batchSize=1 for the large-file tier above, which naturally processes
-    // that list strictly one at a time.
+    // ─── Concurrent execution for the SMALL-file tier: virtual threads, ───────
+    // ─── continuously fed, bounded by a semaphore ──────────────────────────────
+    //
+    // Replaces the previous "batch of PARALLELISM, invokeAll (wait for the
+    // WHOLE batch), next batch of PARALLELISM" pattern, which wasted real
+    // throughput: if 9 of 10 files in a batch finished in seconds but the 10th
+    // hit an OpenAI timeout/retry cascade (routine under load — see
+    // LlmChunkAnalyzer's retry handling), the other 9 worker threads sat
+    // completely idle until that one straggler finished, before the NEXT batch
+    // of 10 could even start. Measured directly on a real run: large stretches
+    // of near-zero CPU usage over many real wall-clock minutes, consistent with
+    // exactly this "whole batch blocked on one straggler" pattern.
+    //
+    // This version submits every file's task immediately (no batch boundaries
+    // to stall on) to Executors.newVirtualThreadPerTaskExecutor() — virtual
+    // threads are cheap enough that "submit all of them at once" is fine even
+    // for thousands of files; each one mostly just blocks on HTTP I/O, which is
+    // exactly what virtual threads are for. A Semaphore caps how many are
+    // actually mid-flight (acquired before the OpenAI call, released after),
+    // so a file that starts while 14 others are still running just waits its
+    // turn WITHOUT blocking any other already-in-flight file's progress —
+    // unlike the old batch-and-wait pattern, one slow file never holds up
+    // files that would otherwise already be moving on to the next one.
+    // Small, fixed stagger between SUBMITTING each of the FIRST maxConcurrent
+    // tasks only — not a rate limiter by itself (the semaphore above is what
+    // actually bounds in-flight requests), but avoids that initial burst all
+    // hitting OpenAI in the exact same instant, which measured directly as a
+    // "thundering herd": several simultaneously-started files all getting HTTP
+    // 429 on their very first attempt together, correlated rather than
+    // independent failures. Only the initial burst needs this — every
+    // submission after that already gets naturally paced by permits.acquire()
+    // blocking until an earlier file finishes and releases its permit, so
+    // staggering every submission (not just the first maxConcurrent) would add
+    // real, unbounded wall-clock cost on a large run (e.g. 250ms x 20,000
+    // files = ~83 minutes of pure submission delay) for no further benefit.
+    private static final long SUBMIT_STAGGER_MS = 250;
+
+    private static void runConcurrently(List<Path> files, int maxConcurrent, Consumer<Path> task) {
+        if (files.isEmpty()) return;
+        Semaphore permits = new Semaphore(Math.max(1, maxConcurrent));
+        CountDownLatch done = new CountDownLatch(files.size());
+
+        try (ExecutorService virtualThreads = Executors.newVirtualThreadPerTaskExecutor()) {
+            int index = 0;
+            for (Path file : files) {
+                virtualThreads.submit(() -> {
+                    try {
+                        permits.acquire();
+                        try {
+                            task.accept(file);
+                        } finally {
+                            permits.release();
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (Exception e) {
+                        System.out.println("  " + file + " ... UNEXPECTED ERROR: " + e.getMessage());
+                    } finally {
+                        done.countDown();
+                    }
+                });
+                index++;
+                if (index < maxConcurrent) {
+                    try {
+                        Thread.sleep(SUBMIT_STAGGER_MS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+            done.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // ─── Batched sequential execution: used ONLY for the large-file tier ──────
+    // (batchSize=1 from processFilesTiered above) — kept deliberately simple
+    // and unchanged: one large, multi-window file at a time, its own undivided
+    // attention, no competing with other concurrent calls for rate-limit
+    // headroom while it works through many windows. See processFilesTiered's
+    // comment for why large files stay out of the concurrent tier entirely.
 
     private static void runInBatches(List<Path> files, int batchSize, Consumer<Path> task) {
         if (files.isEmpty()) return;

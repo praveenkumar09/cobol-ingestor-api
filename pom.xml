@@ -12,6 +12,9 @@
         <maven.compiler.source>23</maven.compiler.source>
         <maven.compiler.target>23</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- Default for plain `mvn exec:java` (no -D flag) — override per-run
+             with -Dexec.mainClass=org.example.SomeOtherClass. -->
+        <exec.mainClass>org.example.Main</exec.mainClass>
     </properties>
 
     <dependencies>
@@ -56,7 +59,15 @@
                 <artifactId>exec-maven-plugin</artifactId>
                 <version>3.1.0</version>
                 <configuration>
-                    <mainClass>org.example.Main</mainClass>
+                    <!-- ${exec.mainClass} property placeholder, not a literal — a
+                         literal here silently ignores -Dexec.mainClass=... on the
+                         command line (a real Maven gotcha: an explicitly-configured
+                         plugin parameter wins over a same-named -D unless the config
+                         itself references the property). Confirmed directly: this
+                         literal caused `mvn exec:java -Dexec.mainClass=org.example.
+                         TestSubsetChunking` to silently run the full Main pipeline
+                         instead, a 7+ hour accidental full-corpus re-ingestion. -->
+                    <mainClass>${exec.mainClass}</mainClass>
                 </configuration>
             </plugin>
         </plugins>

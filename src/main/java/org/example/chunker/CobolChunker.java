@@ -35,6 +35,13 @@ public class CobolChunker {
         return analyzer != null;
     }
 
+    /** Exposed for batch mode (BatchChunkAnalysisService), which builds
+     * prompts/parses results directly against the same analyzer instance
+     * this class's own synchronous chunk() method uses. */
+    public LlmChunkAnalyzer getAnalyzer() {
+        return analyzer;
+    }
+
     public List<FileChunk> chunk(Path filePath, FileType fileType) throws IOException {
         return chunk(filePath, fileType, null);
     }
@@ -56,6 +63,20 @@ public class CobolChunker {
             throw new IOException("LLM chunk analysis failed for " + fileName + ": " + e.getMessage(), e);
         }
 
+        return fromAnalysis(fileName, fileType, lines, analysis, graphBuilder);
+    }
+
+    /**
+     * Post-analysis half of {@link #chunk}, independently callable with a
+     * {@link LlmChunkAnalyzer.ChunkAnalysis} obtained from EITHER the
+     * synchronous path above OR a batch-mode result (see
+     * BatchChunkAnalysisService) — this is what guarantees both paths produce
+     * identical FileChunks and identical knowledge-graph registration, with
+     * zero duplicated logic between them.
+     */
+    public List<FileChunk> fromAnalysis(String fileName, FileType fileType, List<String> lines,
+                                         LlmChunkAnalyzer.ChunkAnalysis analysis,
+                                         KnowledgeGraphBuilder graphBuilder) {
         String programId = (analysis.programId == null || analysis.programId.isBlank())
             ? fileName.replaceAll("\\.[^.]+$", "").toUpperCase()
             : analysis.programId.toUpperCase();

@@ -14,6 +14,16 @@ import java.util.stream.Collectors;
  */
 public class EmbeddingDocumentBuilder {
 
+    // Appended after the metadata block (kept first — plain-business-language
+    // metadata is what actually matches how users phrase questions). A bounded
+    // code excerpt is added on top so literal identifiers/conditions/values
+    // that didn't make it into the (necessarily capped) keyDataFields/
+    // businessConditions lists still enter the embedded text — otherwise
+    // retrieval can ONLY ever be as good as that metadata summary. Bounded
+    // (not the whole chunk) so a large chunk's raw COBOL doesn't dominate and
+    // dilute the more semantically useful metadata that precedes it.
+    private static final int MAX_CODE_CHARS = 800;
+
     public static void process(List<FileChunk> chunks) {
         for (FileChunk chunk : chunks) {
             boolean embeddable = isEmbeddable(chunk);
@@ -122,7 +132,17 @@ public class EmbeddingDocumentBuilder {
             sb.append("Tags: ").append(String.join(", ", chunk.getTags())).append("\n");
         }
 
+        // ── Code excerpt (bounded) — see MAX_CODE_CHARS javadoc ──────────
+        if (chunk.getContent() != null && !chunk.getContent().isBlank()) {
+            sb.append("\nCode excerpt:\n").append(trimForEmbedding(chunk.getContent(), MAX_CODE_CHARS));
+        }
+
         return sb.toString().strip();
+    }
+
+    private static String trimForEmbedding(String content, int maxChars) {
+        String trimmed = content.strip();
+        return trimmed.length() <= maxChars ? trimmed : trimmed.substring(0, maxChars);
     }
 
     // -------------------------------------------------------

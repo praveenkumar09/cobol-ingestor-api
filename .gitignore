@@ -43,6 +43,11 @@ Thumbs.db
 *.log
 logs/
 
+### Secrets ###
+.env
+.env.*
+!.env.example
+
 ### Project: downloaded source & generated output ###
 # Remote source downloads (re-fetched on first run via SOURCE_URL)
 src/main/resources/input/github/

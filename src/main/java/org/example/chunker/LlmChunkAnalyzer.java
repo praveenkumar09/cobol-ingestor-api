@@ -48,21 +48,35 @@ public class LlmChunkAnalyzer {
     private final String model;
     private final String url;
     private final int maxTokens;
+    private final int batchMaxTokens;
     private final int windowLines;
     private final int windowMinLines;
     private final int windowOverlapLines;
     private final HttpClient http;
     private final ObjectMapper mapper;
+    // A known business domain for the WHOLE corpus this run is ingesting (e.g.
+    // "INSURANCE"), or null/blank for none. Deliberately a single global default,
+    // not per-file — most real deployments ingest one organization's codebase,
+    // which is one domain, so per-chunk LLM inference is solving a harder problem
+    // than the deployment actually has. Measured directly: even gpt-4o + the
+    // within-file backfill pass (see backfillGeneralDomains) still left 43% of
+    // chunks GENERAL on a real run, because backfill has nothing to work with
+    // when a whole file's chunks all come back GENERAL with no LLM-inferred
+    // anchor — a known, configured domain sidesteps needing one.
+    private final String domainHint;
 
-    private LlmChunkAnalyzer(String apiKey, String model, String url, int maxTokens,
-                              int windowLines, int windowMinLines, int windowOverlapLines) {
+    private LlmChunkAnalyzer(String apiKey, String model, String url, int maxTokens, int batchMaxTokens,
+                              int windowLines, int windowMinLines, int windowOverlapLines,
+                              String domainHint) {
         this.apiKey             = apiKey;
         this.model              = model;
         this.url                = url;
         this.maxTokens          = maxTokens;
+        this.batchMaxTokens     = batchMaxTokens;
         this.windowLines        = windowLines;
         this.windowMinLines     = windowMinLines;
         this.windowOverlapLines = windowOverlapLines;
+        this.domainHint         = (domainHint == null || domainHint.isBlank()) ? null : domainHint.trim();
         this.http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(30))
             .build();
@@ -71,20 +85,46 @@ public class LlmChunkAnalyzer {
 
     /** Returns null when OPENAI_API_KEY is absent — callers must treat chunking as unavailable. */
     public static LlmChunkAnalyzer create() {
-        String key = System.getenv("OPENAI_API_KEY");
+        String key = AppConfig.getenv("OPENAI_API_KEY");
         if (key == null || key.isBlank()) return null;
 
-        String envModel = System.getenv("OPENAI_CHUNK_MODEL");
-        String chatDefault = AppConfig.get("openai.chat.model", "gpt-4o-mini");
-        String model = (envModel != null && !envModel.isBlank())
-            ? envModel
-            : AppConfig.get("OPENAI_MODEL", "openai.chunk.model", chatDefault);
+        // Dedicated OPENAI_CHUNK_MODEL override only — deliberately no fallback
+        // to the generic OPENAI_MODEL env var (same fix applied to LlmEnricher's
+        // OPENAI_ENRICH_MODEL, for the same reason: a stray OPENAI_MODEL set for
+        // an unrelated purpose must never silently redirect this class's model
+        // choice away from the explicitly-configured openai.chunk.model).
+        String model = AppConfig.get("OPENAI_CHUNK_MODEL", "openai.chunk.model", "gpt-4o-mini");
         String url = AppConfig.get("openai.chat.url", "https://api.openai.com/v1/chat/completions");
         int maxTokens          = AppConfig.getInt("openai.chunk.max-tokens", 16000);
+        // Deliberately smaller than maxTokens above, and used ONLY for batch-
+        // mode's whole-file prompts (see buildBatchRequestBody) — OpenAI
+        // reserves a batch request's FULL max_tokens against the org's
+        // separate, often much smaller "enqueued tokens" quota regardless of
+        // actual output size (confirmed directly: a 164-request gpt-4o batch
+        // at max_tokens=16000 failed outright with "token_limit_exceeded ...
+        // Limit: 90,000 enqueued tokens" for this org — 6 requests alone
+        // would have exceeded it). Safe to size smaller than the synchronous
+        // ceiling WITHOUT any chunk-quality tradeoff: a batch response that
+        // comes back truncated still fails the same coverage validation as
+        // today, and the caller (BatchChunkAnalysisService) already falls
+        // back to the untouched, full-maxTokens, recursive-window-splitting
+        // synchronous chunk() path for that one file — same eventual
+        // quality, just paid for (extra token reservation, extra round
+        // trip) only by the files that actually need it, not every file.
+        int batchMaxTokens = AppConfig.getInt(
+            "OPENAI_BATCH_CHUNK_MAX_TOKENS", "openai.batch.chunk-max-tokens", 8000);
         int windowLines        = AppConfig.getInt("openai.chunk.window-lines", 900);
         int windowMinLines     = AppConfig.getInt("openai.chunk.window-min-lines", 150);
         int windowOverlapLines = AppConfig.getInt("openai.chunk.window-overlap-lines", 150);
-        return new LlmChunkAnalyzer(key, model, url, maxTokens, windowLines, windowMinLines, windowOverlapLines);
+        // Set OPENAI_CHUNK_DOMAIN_HINT=INSURANCE (or openai.chunk.domain-hint in
+        // application.properties) when your whole corpus is one known domain —
+        // see the domainHint field Javadoc above for why this beats per-chunk
+        // inference. Left unset by default (this dev environment's own corpus
+        // genuinely mixes insurance + AWS CardDemo banking files, so a single
+        // hardcoded domain would misclassify half of it).
+        String domainHint = AppConfig.get("OPENAI_CHUNK_DOMAIN_HINT", "openai.chunk.domain-hint", null);
+        return new LlmChunkAnalyzer(key, model, url, maxTokens, batchMaxTokens,
+            windowLines, windowMinLines, windowOverlapLines, domainHint);
     }
 
     public String getModel() { return model; }
@@ -95,6 +135,23 @@ public class LlmChunkAnalyzer {
     // -------------------------------------------------------
 
     public ChunkAnalysis analyze(String fileName, FileType fileType, List<String> lines) {
+        return analyze(fileName, fileType, lines, this.domainHint);
+    }
+
+    /**
+     * @param domainHint a known business domain for this file (e.g. "BANKING" or
+     *                    "INSURANCE"), derived deterministically from which source
+     *                    repo/directory it came from — see Main's processFlat/
+     *                    processOneFile call sites — NOT inferred by the model. Fed
+     *                    into every window's prompt as a strong default, since
+     *                    per-chunk code-only inference was measured defaulting to
+     *                    GENERAL far too often (a real corpus run: 43% of chunks in
+     *                    files from a known-single-domain repo, even after
+     *                    backfillGeneralDomains). Null when the caller has no such
+     *                    signal (e.g. TestSubsetChunking without it) — behavior is
+     *                    then identical to the no-hint overload.
+     */
+    public ChunkAnalysis analyze(String fileName, FileType fileType, List<String> lines, String domainHint) {
         int totalLines = lines.size();
         if (totalLines == 0) {
             return new ChunkAnalysis();
@@ -116,14 +173,113 @@ public class LlmChunkAnalyzer {
         for (int i = 0; i < windows.size(); i++) {
             int[] w = windows.get(i);
             ChunkAnalysis result = analyzeWindowResilient(
-                fileName, fileType, lines, w[0], w[1], context, i + 1, windows.size());
+                fileName, fileType, lines, w[0], w[1], context, i + 1, windows.size(), domainHint);
             results.add(result);
             context.absorb(result);
         }
 
         ChunkAnalysis merged = mergeWindowResults(results);
         fillCoverageGaps(merged, totalLines, fileName);
+        backfillGeneralDomains(merged, fileName);
         return merged;
+    }
+
+    /** Window size this instance is configured with — lets callers (Main's
+     * tiering, BatchChunkAnalysisService) confirm a file is guaranteed
+     * single-window before routing it to batch mode, without duplicating
+     * the windowing threshold as a second constant elsewhere. */
+    public int getWindowLines() { return windowLines; }
+
+    // -------------------------------------------------------
+    // Batch-mode support: build/parse a SINGLE-WINDOW file's whole-file
+    // analysis without making the synchronous HTTP call — used only for
+    // files that fit in one window (size <= windowLines), same guarantee
+    // Main's own small/large tiering already relies on, so there is no
+    // CarriedContext cross-window state to thread through here at all
+    // (unlike the retry-with-recursive-split synchronous path, which large,
+    // multi-window files still use unchanged). See BatchChunkAnalysisService.
+    // -------------------------------------------------------
+
+    /** The exact prompt text for a whole small file — same buildPrompt() the
+     * synchronous single-window path uses, just called directly instead of
+     * from inside analyzeWindowResilient. No carried context (there's only
+     * ever one window) and no domain hint override beyond what this instance
+     * was configured with. */
+    public String buildWholeFilePrompt(String fileName, FileType fileType, List<String> lines) {
+        String numbered = numberLinesRange(lines, 1, lines.size());
+        return buildPrompt(fileName, fileType, numbered, null, this.domainHint);
+    }
+
+    /** Parses one batch result's response text into a ChunkAnalysis, applying
+     * the SAME truncation/coverage validation the synchronous path applies —
+     * throws (NoRetryException/other) exactly like the synchronous call would
+     * on a bad response, so callers use the identical success/failure
+     * handling as today: catch, and fall back to the synchronous chunk() call
+     * for just that file. */
+    public ChunkAnalysis parseWholeFileResponse(String content, int totalLines) {
+        return parseAndValidate(content, 1, totalLines);
+    }
+
+    /** Finishes a single-window analysis with the exact same tail the
+     * multi-window synchronous path applies after merging: coverage-gap
+     * filling (a no-op for a genuinely single, already-full-coverage window,
+     * but cheap and keeps this on the identical code path) and the domain
+     * backfill pass. */
+    public ChunkAnalysis finishWholeFileAnalysis(ChunkAnalysis analysis, int totalLines, String fileName) {
+        ChunkAnalysis merged = mergeWindowResults(List.of(analysis));
+        fillCoverageGaps(merged, totalLines, fileName);
+        backfillGeneralDomains(merged, fileName);
+        return merged;
+    }
+
+    /**
+     * Retroactively fixes chunks still tagged domain=GENERAL once the rest of
+     * THIS SAME FILE has established a real domain — {@link CarriedContext}
+     * only propagates forward to LATER windows, so a chunk from window 1 stays
+     * GENERAL forever even when window 3 of the same file clearly establishes
+     * e.g. BANKING. Measured directly on a real corpus run: 684/1284 chunks
+     * (53%) came back GENERAL, including files (e.g. a CardDemo credit-card
+     * program) with zero legitimately domain-agnostic content anywhere in them.
+     *
+     * <p>Line-weighted majority vote among this file's own non-GENERAL chunks
+     * (same weighting idea as {@code CobolChunker.majorityClassification},
+     * applied here per-file instead of program-registration-wide) — a file
+     * with no non-GENERAL chunks at all (a genuinely domain-agnostic utility)
+     * is left untouched, since there's nothing to backfill from.
+     */
+    private void backfillGeneralDomains(ChunkAnalysis merged, String fileName) {
+        Map<String, Integer> weightByKey = new LinkedHashMap<>();
+        Map<String, String[]> valueByKey = new HashMap<>();
+        for (ChunkSpec c : merged.chunks) {
+            if (c.domain == null || "GENERAL".equalsIgnoreCase(c.domain)) continue;
+            String key = c.domain + "|" + c.subDomain;
+            int lines = Math.max(1, c.lineEnd - c.lineStart + 1);
+            weightByKey.merge(key, lines, Integer::sum);
+            valueByKey.putIfAbsent(key, new String[]{c.domain, c.subDomain});
+        }
+        if (weightByKey.isEmpty()) return; // nothing non-GENERAL to backfill from
+
+        String bestKey = weightByKey.entrySet().stream()
+            .max(Map.Entry.comparingByValue())
+            .map(Map.Entry::getKey)
+            .orElse(null);
+        String[] majority = valueByKey.get(bestKey);
+
+        int backfilled = 0;
+        for (ChunkSpec c : merged.chunks) {
+            if (c.domain == null || "GENERAL".equalsIgnoreCase(c.domain)) {
+                c.domain = majority[0];
+                if (c.subDomain == null || "GENERAL".equalsIgnoreCase(c.subDomain)) {
+                    c.subDomain = majority[1];
+                }
+                backfilled++;
+            }
+        }
+        if (backfilled > 0) {
+            System.out.println("  " + fileName + " ... backfilled " + backfilled
+                + " GENERAL chunk(s) to " + majority[0] + "/" + majority[1]
+                + " (established by the rest of this file)");
+        }
     }
 
     /**
@@ -209,7 +365,7 @@ public class LlmChunkAnalyzer {
 
     private ChunkAnalysis analyzeWindowResilient(String fileName, FileType fileType, List<String> lines,
                                                   int start, int end, CarriedContext context,
-                                                  int windowNumber, int totalWindows) {
+                                                  int windowNumber, int totalWindows, String domainHint) {
         int size = end - start + 1;
         String progress = totalWindows > 1 ? " [window " + windowNumber + "/" + totalWindows + "]" : "";
         String label = fileName + progress + " [lines " + start + "-" + end + "]";
@@ -217,7 +373,7 @@ public class LlmChunkAnalyzer {
         try {
             ChunkAnalysis result = RetryUtil.withRetry(label, attempt -> {
                 String numbered = numberLinesRange(lines, start, end);
-                String prompt = buildPrompt(fileName, fileType, numbered, context.describeForPrompt());
+                String prompt = buildPrompt(fileName, fileType, numbered, context.describeForPrompt(), domainHint);
                 String json = callOpenAiClassified(prompt);
                 return parseAndValidate(json, start, end);
             });
@@ -233,9 +389,9 @@ public class LlmChunkAnalyzer {
             System.out.println("  " + label + " ... failed (" + e.getMessage() + "), splitting and retrying");
             int mid = start + size / 2;
             ChunkAnalysis left  = analyzeWindowResilient(
-                fileName, fileType, lines, start, mid - 1, context, windowNumber, totalWindows);
+                fileName, fileType, lines, start, mid - 1, context, windowNumber, totalWindows, domainHint);
             ChunkAnalysis right = analyzeWindowResilient(
-                fileName, fileType, lines, mid, end, context, windowNumber, totalWindows);
+                fileName, fileType, lines, mid, end, context, windowNumber, totalWindows, domainHint);
             return mergeTwo(left, right);
         }
     }
@@ -265,6 +421,48 @@ public class LlmChunkAnalyzer {
     private static void recordPermanentFailure(String fileName, String message) {
         FAILURE_REASON_COUNTS.computeIfAbsent(categorizeFailure(message), k -> new AtomicInteger()).incrementAndGet();
         FAILURE_FILE_COUNTS.computeIfAbsent(fileName, k -> new AtomicInteger()).incrementAndGet();
+    }
+
+    // -------------------------------------------------------
+    // subDomain convergence: the model is free to invent an UPPER_SNAKE_CASE
+    // label per chunk with no fixed taxonomy, which measured 97 distinct
+    // labels on a real corpus run, including near-duplicates that split what
+    // should be one bucket (TRANSACTION_MANAGEMENT / TRANSACTION_PROCESSING /
+    // TRANSACTION_VIEWING). Two low-risk fixes, neither removing the model's
+    // ability to label something genuinely new:
+    //   1. A deterministic alias map for the specific duplicates already
+    //      observed (cheap, exact, no LLM judgment involved).
+    //   2. A running usage-count hint fed back into later prompts ("prefer
+    //      reusing one of these") so labels converge as a corpus run
+    //      progresses, instead of every file re-inventing its own words for
+    //      the same concept.
+    // -------------------------------------------------------
+
+    private static final Map<String, String> SUBDOMAIN_ALIASES = Map.of(
+        "TRANSACTION_PROCESSING", "TRANSACTION_MANAGEMENT",
+        "TRANSACTION_VIEWING", "TRANSACTION_MANAGEMENT"
+    );
+
+    private static final Map<String, AtomicInteger> SUBDOMAIN_USAGE_COUNTS = new ConcurrentHashMap<>();
+
+    private static String normalizeSubDomain(String subDomain) {
+        if (subDomain == null) return null;
+        String canonical = SUBDOMAIN_ALIASES.getOrDefault(subDomain, subDomain);
+        SUBDOMAIN_USAGE_COUNTS.computeIfAbsent(canonical, k -> new AtomicInteger()).incrementAndGet();
+        return canonical;
+    }
+
+    /** Top ~30 sub-domains seen so far in this run, most-used first — fed into
+     * later prompts as a soft preference (see buildPrompt). Empty until the
+     * first few files establish some usage; harmless (prompt section omitted)
+     * at that point. */
+    private static String topSubDomainsHint() {
+        if (SUBDOMAIN_USAGE_COUNTS.isEmpty()) return null;
+        return SUBDOMAIN_USAGE_COUNTS.entrySet().stream()
+            .sorted((a, b) -> b.getValue().get() - a.getValue().get())
+            .limit(30)
+            .map(Map.Entry::getKey)
+            .collect(java.util.stream.Collectors.joining(", "));
     }
 
     /** A coverage gap — distinct from an outright analysis failure (see
@@ -640,7 +838,8 @@ public class LlmChunkAnalyzer {
         return sb.toString();
     }
 
-    private String buildPrompt(String fileName, FileType fileType, String numberedSource, String carriedContext) {
+    private String buildPrompt(String fileName, FileType fileType, String numberedSource,
+                                String carriedContext, String domainHint) {
         String kindGuidance = switch (fileType) {
             case COPYBOOK -> """
                 This file is a COBOL COPYBOOK: a pure data-layout definition with no PROCEDURE DIVISION.
@@ -698,7 +897,7 @@ public class LlmChunkAnalyzer {
 
             FILE: %s
             DECLARED TYPE HINT: %s (a hint only — override it if the code itself indicates otherwise)
-
+            %s
             %s
             %s
             SOURCE (line-numbered; the lineStart/lineEnd you return must match these numbers exactly —
@@ -715,7 +914,16 @@ public class LlmChunkAnalyzer {
                file).
             2. Split the shown lines into an ORDERED list of non-overlapping chunks that each represent one
                coherent unit. Merge trivial fragments; split any unit larger than ~200 lines at a natural
-               sub-boundary. Every line shown must belong to some chunk — including a partial unit at the
+               sub-boundary. PROCEDURE DIVISION code specifically gets finer granularity than that blanket
+               200-line cap: when the code defines distinct NAMED paragraphs/sections, prefer one chunk per
+               named paragraph — even several short paragraphs in a row — rather than merging them into one
+               large block just because the whole block is still under 200 lines; only merge adjacent
+               paragraphs when they're individually trivial (a handful of lines) AND tightly coupled (e.g. a
+               paragraph that exists solely to fall through into the next one). A single PROCEDURE DIVISION
+               chunk covering multiple independent business rules/validations under one citation is exactly
+               what this finer granularity avoids — cap procedure-division chunks at ~120 lines, not 200,
+               splitting at the nearest paragraph boundary once a chunk would exceed that. Every line shown
+               must belong to some chunk — including a partial unit at the
                very start or end of this excerpt if the excerpt begins or ends mid-structure, and including
                blank lines, comment-only lines, and lines between paragraphs that don't feel like they
                belong to either neighbor — attribute those to whichever adjacent chunk they're physically
@@ -798,13 +1006,60 @@ public class LlmChunkAnalyzer {
                 }
               ]
             }
-            """.formatted(fileName, fileType.label, kindGuidance,
+            """.formatted(fileName, fileType.label,
+                domainHintText(domainHint), kindGuidance,
                 carriedContext != null ? carriedContext : "", numberedSource);
+    }
+
+    /**
+     * Blank when no domainHint is configured (identical prompt to before this
+     * feature existed). When set, a STRONG default — not a soft suggestion —
+     * since per-chunk code-only inference was measured defaulting to GENERAL
+     * on 43% of chunks even with a stronger model and a within-file backfill
+     * pass; a deployment-level known domain is a much more reliable signal
+     * than hoping isolated code reads as domain-specific on its own.
+     */
+    private String domainHintText(String domainHint) {
+        if (domainHint == null) return "";
+        return "KNOWN DOMAIN: this entire corpus is known, with certainty, to belong to the \""
+            + domainHint + "\" business domain (configured at the deployment level, not inferred). "
+            + "Use domain=\"" + domainHint + "\" for every chunk by default — do NOT default to "
+            + "GENERAL. Only deviate from \"" + domainHint + "\" if this SPECIFIC chunk's code "
+            + "unambiguously indicates something else (e.g. a truly generic, industry-agnostic "
+            + "system utility with no domain-specific logic at all).\n";
     }
 
     // -------------------------------------------------------
     // OpenAI call + JSON parsing
     // -------------------------------------------------------
+
+    /** The request body shape used by the synchronous call below — model/
+     * temperature/response_format/max_tokens all as configured for the
+     * proven, retry-capable synchronous path. */
+    Map<String, Object> buildRequestBody(String prompt) {
+        return buildRequestBody(prompt, maxTokens);
+    }
+
+    /** Batch-mode's JSONL request lines use this — identical model/
+     * temperature/response_format to the synchronous path (still shares
+     * buildRequestBody(prompt, int) below, so those settings can never
+     * drift apart), but batchMaxTokens instead of maxTokens. See
+     * batchMaxTokens's Javadoc in create() for why a smaller reservation
+     * here is safe: a truncated batch response just falls back to this
+     * exact synchronous path, at full maxTokens, for that one file. */
+    Map<String, Object> buildBatchRequestBody(String prompt) {
+        return buildRequestBody(prompt, batchMaxTokens);
+    }
+
+    private Map<String, Object> buildRequestBody(String prompt, int maxTokensForThisCall) {
+        return Map.of(
+            "model", model,
+            "messages", List.of(Map.of("role", "user", "content", prompt)),
+            "max_tokens", maxTokensForThisCall,
+            "temperature", 0.1,
+            "response_format", Map.of("type", "json_object")
+        );
+    }
 
     /**
      * Calls OpenAI and classifies failures for the retry loop:
@@ -812,13 +1067,7 @@ public class LlmChunkAnalyzer {
      *   - other 4xx (e.g. context-length-exceeded), empty content -> NoRetryException (escalate: shrink window)
      */
     private String callOpenAiClassified(String prompt) throws Exception {
-        Map<String, Object> body = Map.of(
-            "model", model,
-            "messages", List.of(Map.of("role", "user", "content", prompt)),
-            "max_tokens", maxTokens,
-            "temperature", 0.1,
-            "response_format", Map.of("type", "json_object")
-        );
+        Map<String, Object> body = buildRequestBody(prompt);
 
         HttpRequest request = HttpRequest.newBuilder()
             .uri(URI.create(url))
@@ -975,7 +1224,7 @@ public class LlmChunkAnalyzer {
             spec.lineEnd = c.path("lineEnd").asInt(0);
             spec.sectionPurpose = c.path("sectionPurpose").asText("");
             spec.domain = c.path("domain").asText("GENERAL");
-            spec.subDomain = textOrNull(c, "subDomain");
+            spec.subDomain = normalizeSubDomain(textOrNull(c, "subDomain"));
             spec.processingType = textOrNull(c, "processingType");
             spec.filesRead = textArray(c.path("filesRead"));
             spec.filesWritten = textArray(c.path("filesWritten"));

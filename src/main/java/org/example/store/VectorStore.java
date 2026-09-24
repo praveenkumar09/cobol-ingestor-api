@@ -69,7 +69,35 @@ public class VectorStore implements AutoCloseable {
         String url  = "jdbc:postgresql://" + host + ":" + port + "/" + db;
         Connection conn = DriverManager.getConnection(url, user, pass);
         conn.setAutoCommit(false);
+        ensureHybridSearchSchema(conn);
         return new VectorStore(conn);
+    }
+
+    /**
+     * Idempotent migration for volumes that already existed before hybrid
+     * (vector + keyword) search was added — see docker/init.sql for the
+     * fresh-volume path, which defines the same column/index. Runs on every
+     * connect (cheap IF NOT EXISTS checks), same self-provisioning pattern
+     * cobalt-rag-api's Java-side stores (AuthStore, ConversationStore) use for
+     * their own tables.
+     *
+     * <p>{@code 'simple'} text-search config deliberately, not {@code 'english'}
+     * — English stemming/stopword removal would mangle hyphenated COBOL
+     * identifiers (WS-POLICY-YEARS) and code tokens rather than helping match
+     * them; 'simple' just lowercases and tokenizes.
+     */
+    private static void ensureHybridSearchSchema(Connection conn) throws SQLException {
+        try (Statement st = conn.createStatement()) {
+            st.execute("""
+                ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_tsv tsvector
+                    GENERATED ALWAYS AS (to_tsvector('simple', coalesce(content, ''))) STORED
+                """);
+            st.execute("CREATE INDEX IF NOT EXISTS idx_chunks_content_tsv ON chunks USING gin (content_tsv)");
+            conn.commit();
+        } catch (SQLException e) {
+            conn.rollback();
+            throw e;
+        }
     }
 
     /**

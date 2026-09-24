@@ -35,6 +35,12 @@ public class JclChunker {
         return analyzer != null;
     }
 
+    /** Exposed for batch mode (BatchChunkAnalysisService) — see CobolChunker's
+     * identical getAnalyzer(). */
+    public LlmChunkAnalyzer getAnalyzer() {
+        return analyzer;
+    }
+
     public List<FileChunk> chunk(Path filePath) throws IOException {
         return chunk(filePath, null);
     }
@@ -55,6 +61,15 @@ public class JclChunker {
             throw new IOException("LLM chunk analysis failed for " + fileName + ": " + e.getMessage(), e);
         }
 
+        return fromAnalysis(fileName, lines, analysis, graphBuilder);
+    }
+
+    /** Post-analysis half of {@link #chunk} — see CobolChunker's identical
+     * fromAnalysis() for why this split exists (batch mode and the
+     * synchronous path both funnel through this one method). */
+    public List<FileChunk> fromAnalysis(String fileName, List<String> lines,
+                                         LlmChunkAnalyzer.ChunkAnalysis analysis,
+                                         KnowledgeGraphBuilder graphBuilder) {
         String jobName = (analysis.programId == null || analysis.programId.isBlank())
             ? fileName.replaceAll("\\.[^.]+$", "").toUpperCase()
             : analysis.programId.toUpperCase();
