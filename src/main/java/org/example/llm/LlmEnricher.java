@@ -174,7 +174,7 @@ public class LlmEnricher {
             .uri(URI.create(openaiUrl))
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer " + apiKey)
-            .timeout(Duration.ofSeconds(60))
+            .timeout(Duration.ofSeconds(6000))
             .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
             .build();
 

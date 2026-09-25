@@ -824,7 +824,7 @@ public class LlmChunkAnalyzer {
             .uri(URI.create(url))
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer " + apiKey)
-            .timeout(Duration.ofSeconds(120))
+            .timeout(Duration.ofSeconds(60000))
             .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
             .build();
 
