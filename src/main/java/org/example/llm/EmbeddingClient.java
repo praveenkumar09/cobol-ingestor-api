@@ -15,12 +15,12 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Calls OpenAI Embeddings API (text-embedding-3-small, 1536 dims).
+ * Calls OpenAI Embeddings API (text-embedding-3-large, 3072 dims).
  * Set OPENAI_API_KEY to enable; OPENAI_EMBED_MODEL to override model.
  */
 public class EmbeddingClient {
 
-    public static final int DIMS       = AppConfig.getInt("openai.embed.dims", 1536);
+    public static final int DIMS       = AppConfig.getInt("openai.embed.dims", 3072);
     public static final int BATCH_SIZE = AppConfig.getInt("openai.embed.batch-size", 50);
 
     private final String apiKey;
@@ -43,7 +43,7 @@ public class EmbeddingClient {
         if (key == null || key.isBlank()) return null;
         String m   = System.getenv("OPENAI_EMBED_MODEL");
         String url = AppConfig.get("openai.embed.url", "https://api.openai.com/v1/embeddings");
-        String defaultModel = AppConfig.get("openai.embed.model", "text-embedding-3-small");
+        String defaultModel = AppConfig.get("openai.embed.model", "text-embedding-3-large");
         return new EmbeddingClient(key, (m != null && !m.isBlank()) ? m : defaultModel, url);
     }
 
@@ -56,10 +56,11 @@ public class EmbeddingClient {
     public List<float[]> embedBatch(List<String> texts) throws Exception {
         if (texts.isEmpty()) return List.of();
 
-        // "dimensions" projects text-embedding-3-{small,large} down to DIMS
-        // (default 1536) so the output always matches the pgvector column's
-        // fixed size, regardless of a model's native output size (e.g.
-        // text-embedding-3-large natively returns 3072).
+        // "dimensions" pins the output to DIMS (default 3072 — the native
+        // size of text-embedding-3-large) so it always matches the pgvector
+        // column's fixed size. Left in place rather than hardcoded so a
+        // smaller projected size (e.g. 1536) stays possible via config
+        // without a code change, but production now runs at native 3072.
         Map<String, Object> body = Map.of(
             "model", model,
             "input", texts,
